@@ -153,7 +153,7 @@ class TelegramBot:
 
         return res.get("result")
 
-    def send(self, text: str) -> None:
+    def send(self, text: str, actions=None) -> None:
         """Sends sanitized text to the fixed bound chat (self.service.user_id).
 
         Neutralizes @ and control/bidi characters, splits BEFORE escaping into chunks
@@ -165,7 +165,7 @@ class TelegramBot:
 
         cleaned = _neutralize(text)
         chunks = _split_utf16_units(cleaned, max_units=MAX_UTF16_CHUNK)
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks):
             if not chunk:
                 continue
             escaped = html.escape(chunk)
@@ -176,6 +176,9 @@ class TelegramBot:
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             }
+            if actions and index == len(chunks) - 1:
+                payload["reply_markup"] = {"inline_keyboard": [[{"text": _neutralize(button["text"]), "callback_data": button["data"]}
+                                                                for button in row] for row in actions]}
             self.request("sendMessage", payload)
 
     def parse_command(self, text: str) -> tuple[str | None, list[str], str | None]:
@@ -194,9 +197,10 @@ class TelegramBot:
             command = first.removeprefix("/").lower()
         if command not in COMMANDS:
             return None, [], "未知命令；使用 /canvas help 查看可用操作。"
-        if len(parts) > 1:
-            return None, [], "该命令不接受参数。"
-        return command, [], None
+        params = parts[1:]
+        if params and not (command == "tasks" and params == ["stopped"]):
+            return None, [], "该命令不接受这些参数。"
+        return command, params, None
 
     def handle_update(self, update: dict, executor=None) -> None:
         """Handles an incoming Telegram update.
@@ -206,6 +210,24 @@ class TelegramBot:
         Unauthorized or group messages are silently ignored with NO outbound requests.
         """
         if not isinstance(update, dict):
+            return
+        callback = update.get("callback_query")
+        if isinstance(callback, dict):
+            message = callback.get("message")
+            chat = message.get("chat", {}) if isinstance(message, dict) else {}
+            sender = callback.get("from", {})
+            try:
+                authorized = (chat.get("type") == "private" and int(chat.get("id")) == int(self.service.user_id)
+                              and int(sender.get("id")) == int(self.service.user_id) and not sender.get("is_bot"))
+            except (TypeError, ValueError, AttributeError):
+                authorized = False
+            if authorized and isinstance(callback.get("id"), str):
+                try:
+                    result = self.service.task_action(int(self.service.user_id), callback.get("data"))
+                    self.request("answerCallbackQuery", {"callback_query_id": callback["id"]})
+                    self.send(result["text"], result.get("actions"))
+                except Exception:
+                    sys.stderr.write("Telegram 按钮处理失败。\n")
             return
 
         message = update.get("message")
@@ -268,7 +290,7 @@ class TelegramBot:
             with FileLock(os.path.join(self.service.home, "service-telegram-delivery.lock")):
                 if command in ("refresh", "report"):
                     result = self.service.execute(identity, "report", [], "telegram", correlation_id)
-                self.send(result["text"])
+                self.send(result["text"], result.get("actions"))
                 self.service.acknowledge_delivery(result)
         except Exception:
             sys.stderr.write("Telegram 命令处理或投递失败；可重新请求快照。\n")
@@ -281,8 +303,8 @@ class TelegramBot:
         """Executes long polling loop against the Telegram Bot API.
 
         Verifies bot identity via getMe, verifies no active webhook via getWebhookInfo
-        (rejecting without deleting), and polls getUpdates with timeout=30 and
-        allowed_updates=['message'].
+        (rejecting without deleting), registers the bound chat's command menu,
+        and polls getUpdates with timeout=30 for messages and callback queries.
         """
         # 1. getMe verifies bot
         me = self.request("getMe")
@@ -296,11 +318,20 @@ class TelegramBot:
         if isinstance(webhook_info, dict) and webhook_info.get("url"):
             raise ValueError("Webhook is active; long polling rejected")
 
+        self.request("setMyCommands", {
+            "commands": [{"command": name, "description": description}
+                         for name, description in COMMANDS.items()],
+            "scope": {"type": "chat", "chat_id": int(self.service.user_id)},
+        })
+        self.request("setChatMenuButton", {
+            "chat_id": int(self.service.user_id), "menu_button": {"type": "commands"},
+        })
+
         # Keep polling while refresh commands join a shared account collection.
         with ThreadPoolExecutor(max_workers=4) as executor:
             offset: int | None = None
             while not self._stopped:
-                payload: dict[str, Any] = {"timeout": 30, "allowed_updates": ["message"]}
+                payload: dict[str, Any] = {"timeout": 30, "allowed_updates": ["message", "callback_query"]}
                 if offset is not None:
                     payload["offset"] = offset
                 try:

@@ -16,6 +16,8 @@ COMMANDS = {
     "status": "查看服务及快照状态，不访问 Canvas",
     "report": "查看当前快照日报及数据时间，不访问 Canvas",
     "refresh": "立即重新采集并生成规则日报",
+    "tasks": "查看任务、已停止项和确认按钮；/canvas tasks stopped 查看已停止项，不访问 Canvas",
+
 }
 
 
@@ -112,6 +114,119 @@ class AccountService:
             saved["events"] = [event for event in saved.get("events", []) if event["pending"]]
             jsave(self.report_path, saved)
 
+    def _authorized(self, identity):
+        ctx = _CollectionContext(self.home, quiet=True)
+        secrets = ServiceSecrets(ctx.cfg, self.secrets_path)
+        if identity != self.user_id or self._binding(secrets) != self.binding:
+            raise ValueError("账号绑定已变更，请管理员重启服务")
+        return ctx
+
+    @staticmethod
+    def _task_version(saved, aid):
+        fact = saved.get("snapshot", {}).get("assignments", {}).get(aid)
+        if not fact:
+            return None
+        return [fact.get("course"), fact.get("due_at"), fact.get("sub_state"),
+                fact.get("excused"), saved.get("last_attempt", {}).get("id"),
+                saved.get("reminders", {}).get(aid)]
+    @staticmethod
+    def _task_valid(ctx, saved, aid):
+        fact = saved.get("snapshot", {}).get("assignments", {}).get(aid)
+        return (fact if fact and fact.get("course") in
+                {code for _, code in course_pairs(ctx.cfg, include_inactive=False)} else None)
+
+    @staticmethod
+    def _button(saved, aid, phase, label, version):
+        token = uuid.uuid4().hex
+        saved.setdefault("task_buttons", {})[token] = {"aid": aid, "phase": phase,
+                                                       "version": version,
+                                                       "at": dt.datetime.now(dt.timezone.utc).timestamp()}
+        return {"text": label, "data": "task:" + token}
+
+    def task_list(self, identity, stopped=False, page=0):
+        ctx = self._authorized(identity)
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved()
+            if not saved or not saved.get("snapshot"):
+                return self._result("尚无任务快照；使用 /canvas refresh。")
+            entries = [(aid, fact) for aid, fact in saved["snapshot"]["assignments"].items()
+                       if self._task_valid(ctx, saved, aid) and
+                       (aid in saved.get("reminders", {})) == stopped]
+            entries.sort(key=lambda item: (item[1].get("due_at") or "", item[1].get("course") or "", item[0]))
+            if page < 0 or page > max(0, (len(entries) - 1) // 8):
+                return self._result("任务列表已过期，请重新打开。")
+            selected = entries[page * 8:(page + 1) * 8]
+            lines = ["已停止提醒" if stopped else "任务列表", f"数据截至：{saved.get('collected_at')}"]
+            actions = []
+            for index, (aid, fact) in enumerate(selected, page * 8 + 1):
+                state = fact.get("sub_state")
+                status = "Canvas 已提交/豁免" if state in ("submitted", "excused") or fact.get("excused") else ("需确认" if state == "unknown" else "待交")
+                lines.append(f"{index}. {fact['course']} · {fact.get('name') or aid} — {fact.get('due_at') or '日期不明'}；{status}\n{fact.get('html_url') or '来源链接未提供'}")
+                if stopped:
+                    lines.append("停止原因：" + (saved["reminders"][aid].get("reason") or "未填写"))
+                actions.append([self._button(saved, aid, "select", f"{index}. " + ("恢复" if stopped else "停止"), self._task_version(saved, aid))])
+            if not selected:
+                lines.append("无")
+            navigation = []
+            for target, label in ((page - 1, "上一页"), (page + 1, "下一页")):
+                if 0 <= target <= (len(entries) - 1) // 8:
+                    navigation.append(self._button(saved, "", "page:" + str(int(stopped)) + ":" + str(target), label, None))
+            navigation.append(self._button(saved, "", "page:" + str(int(not stopped)) + ":0", "查看任务" if stopped else "查看已停止" , None))
+            actions.append(navigation)
+            saved["task_buttons"] = dict(list(saved.get("task_buttons", {}).items())[-300:])
+            jsave(self.report_path, saved)
+        return {**self._result("\n".join(lines), saved), "actions": actions}
+
+    def task_action(self, identity, data):
+        ctx = self._authorized(identity)
+        if not isinstance(data, str) or not data.startswith("task:") or len(data) != 37:
+            return self._result("按钮无效，请重新打开任务列表。")
+        page_request = None
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved()
+            if not saved:
+                return self._result("按钮已过期，请重新打开任务列表。")
+            button = saved.get("task_buttons", {}).pop(data[5:], None)
+            if not button:
+                return self._result("按钮已过期，请重新打开任务列表。")
+            if dt.datetime.now(dt.timezone.utc).timestamp() - button["at"] > 900:
+                jsave(self.report_path, saved)
+                return self._result("按钮已过期，请重新打开任务列表。")
+            phase, aid = button["phase"], button["aid"]
+            if phase.startswith("page:"):
+                _, stopped, page = phase.split(":")
+                page_request = bool(int(stopped)), int(page)
+                jsave(self.report_path, saved)
+            else:
+                fact = self._task_valid(ctx, saved, aid)
+                if not fact or button["version"] != self._task_version(saved, aid):
+                    jsave(self.report_path, saved)
+                    return self._result("任务状态已变化，请重新打开任务列表。")
+                if phase == "cancel":
+                    jsave(self.report_path, saved)
+                    return self._result("已取消，提醒状态未变。")
+                stopping = aid not in saved.get("reminders", {})
+                if phase == "select":
+                    actions = [[self._button(saved, aid, "confirm", "确认停止" if stopping else "确认恢复", button["version"]),
+                                self._button(saved, aid, "cancel", "取消", button["version"])]]
+                    if stopping:
+                        actions.append([self._button(saved, aid, "reason:线下完成", "线下完成并停止", button["version"])])
+                    jsave(self.report_path, saved)
+                    return {**self._result(("确认停止提醒" if stopping else "确认恢复提醒") +
+                                           f"：{fact['course']} · {fact.get('name') or aid}\n{fact.get('html_url') or '来源链接未提供'}"),
+                            "actions": actions}
+                if phase not in ("confirm", "reason:线下完成") or (phase.startswith("reason:") and not stopping):
+                    jsave(self.report_path, saved)
+                    return self._result("按钮已过期，请重新打开任务列表。")
+                if stopping:
+                    saved.setdefault("reminders", {})[aid] = {"reason": phase.partition(":")[2], "at": ctx.clock.now_utc().isoformat()}
+                else:
+                    del saved["reminders"][aid]
+                jsave(self.report_path, saved)
+                return self._result("已停止提醒。" if stopping else "已恢复提醒。", saved)
+        return self.task_list(identity, *page_request)
+
+
     def execute(self, identity, command, params, channel, correlation_id):
         # Recheck administrator configuration before every operation, including reads.
         ctx = _CollectionContext(self.home, quiet=True)
@@ -119,7 +234,7 @@ class AccountService:
         if (identity != self.user_id or channel != "telegram"
                 or self._binding(secrets) != self.binding):
             raise ValueError("账号绑定已变更，请管理员重启服务")
-        if params or command not in COMMANDS:
+        if command not in COMMANDS or (params and not (command == "tasks" and params == ["stopped"])):
             return self._result("命令或参数不支持；使用 /canvas help 查看可用操作。")
         saved = self._saved()
         if command == "help":
@@ -132,6 +247,8 @@ class AccountService:
             return self._result(text, saved)
         if command == "report":
             return self._report_result(ctx, saved)
+        if command == "tasks":
+            return self.task_list(identity, stopped=bool(params))
         saved = self._collect()
         return self._report_result(_CollectionContext(self.home, quiet=True), saved)
 
@@ -216,8 +333,14 @@ class AccountService:
                 append("added", "新增：" + label)
             elif before is not None and fact.get("due_at") != before.get("due_at"):
                 append("due", f"改期：{label}\n{before.get('due_at') or '日期不明'} → {fact.get('due_at') or '日期不明'}")
+                if aid in saved.get("reminders", {}):
+                    saved["reminders"].pop(aid)
+                    append("reminder", ("改期后停止状态解除（已提交，无需催交）：" if fact.get("sub_state") in ("submitted", "excused") or fact.get("excused") else "改期后恢复提醒：") + label)
             if fact.get("sub_state") == "resubmit" and before and before.get("sub_state") != "resubmit":
                 append("redo", "Canvas 要求重新提交：" + label)
+                if aid in saved.get("reminders", {}):
+                    saved["reminders"].pop(aid)
+                    append("reminder", "明确要求重新提交后恢复提醒：" + label)
             if fact.get("sub_state") != "submitted":
                 continue
             submitted = parse_ts(fact.get("submitted_at"))
@@ -292,8 +415,10 @@ class AccountService:
         sections = {"未来七天待交": [], "逾期未交": [], "日期不明任务": [],
                     "新增与改期": [], "最近已提交（尚未通知）": [], "新课程与课程变化": [],
                     "暂停提醒的旧数据": []}
-        for fact in sorted(snap.get("assignments", {}).values(), key=lambda a: (a.get("due_at") or "", a["course"], a.get("name") or "")):
+        for aid, fact in sorted(snap.get("assignments", {}).items(), key=lambda item: (item[1].get("due_at") or "", item[1]["course"], item[1].get("name") or "")):
             state = fact.get("sub_state")
+            if aid in saved.get("reminders", {}):
+                continue
             if state in ("submitted", "excused") or fact.get("excused"):
                 continue
             due = parse_ts(fact.get("due_at"))

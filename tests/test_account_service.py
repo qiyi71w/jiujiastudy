@@ -335,6 +335,149 @@ class SecureRefresh(unittest.TestCase):
             bot.handle_update(update)
             self.assertNotIn("Retry submission notice", "".join(sent))
 
+    def test_task_buttons_persist_cancel_replay_rearm_and_submission_priority(self):
+        task = self.sc.course[1101]["assignments"][0]
+        for course in self.sc.course.values():
+            course["assignments"] = []
+        self.sc.course[1101]["assignments"] = [task]
+        task.update(name="Task decision", due_at="2026-03-27T10:00:00Z",
+                    submission={"workflow_state": "unsubmitted"})
+        self.command("refresh")
+        self.server.requests(clear=True)
+        listing = self.command("tasks")
+        self.assertIn("Task decision", listing["text"])
+        selection = listing["actions"][0][0]["data"]
+        with self.assertRaises(ValueError):
+            self.service.task_action(4321, selection)
+        confirm = self.service.task_action(1234, selection)
+        self.service.task_action(1234, confirm["actions"][0][1]["data"])
+        self.assertIn("Task decision", self.command("report")["text"])
+        selection = self.command("tasks")["actions"][0][0]["data"]
+        options = self.service.task_action(1234, selection)
+        stop = options["actions"][1][0]["data"]
+        self.service.task_action(1234, stop)
+        self.assertNotIn("Task decision", self.command("report")["text"])
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        self.assertIn("Task decision", restarted.execute(1234, "tasks", ["stopped"], "telegram", "test")["text"])
+        self.service.task_action(1234, options["actions"][0][0]["data"])
+        self.assertIn("Task decision", restarted.execute(1234, "tasks", ["stopped"], "telegram", "test")["text"])
+        self.assertEqual([], self.server.requests())
+        task["due_at"] = "2026-03-28T10:00:00Z"
+        refreshed = self.command("refresh")
+        self.assertIn("Task decision", refreshed["text"])
+        self.assertNotIn("Task decision", self.service.execute(1234, "tasks", ["stopped"], "telegram", "test")["text"])
+        notices = [event for event in jload(Path(self.home.archive, "service-report.json"))["events"]
+                   if event["kind"] == "reminder"]
+        self.assertEqual(1, len(notices))
+        self.service.acknowledge_delivery(refreshed)
+        self.command("refresh")
+        self.assertEqual(1, sum(event["kind"] == "reminder" for event in
+                                jload(Path(self.home.archive, "service-report.json"))["events"]))
+        selection = self.command("tasks")["actions"][0][0]["data"]
+        pending = self.service.task_action(1234, selection)["actions"][0][0]["data"]
+        task["due_at"] = "2026-03-29T10:00:00Z"
+        self.command("refresh")
+        self.service.task_action(1234, pending)
+        self.assertNotIn("Task decision", self.service.execute(1234, "tasks", ["stopped"], "telegram", "test")["text"])
+
+    def test_reminder_rearms_only_on_explicit_change_and_keeps_submitted_filtered(self):
+        task = self.sc.course[1101]["assignments"][0]
+        for course in self.sc.course.values():
+            course["assignments"] = []
+        self.sc.course[1101]["assignments"] = [task]
+        task.update(name="Submission priority", due_at="2026-03-27T10:00:00Z",
+                    submission={"workflow_state": "unsubmitted"})
+        self.command("refresh")
+        def stop():
+            selected = self.command("tasks")["actions"][0][0]["data"]
+            confirmed = self.service.task_action(1234, selected)["actions"][0][0]["data"]
+            self.service.task_action(1234, confirmed)
+        stop()
+        task["submission"] = {"workflow_state": "graded", "score": 0, "grade": "F", "comment": "Revise?"}
+        self.command("refresh")
+        self.assertIn("Submission priority", self.service.execute(1234, "tasks", ["stopped"], "telegram", "test")["text"])
+        task["submission"]["redo_request"] = True
+        redo = self.command("refresh")
+        self.assertIn("Submission priority", redo["text"])
+        self.service.acknowledge_delivery(redo)
+        self.command("refresh")
+        self.assertEqual(1, sum(event["kind"] == "reminder" for event in
+                                jload(Path(self.home.archive, "service-report.json"))["events"]))
+        task["submission"] = {"workflow_state": "submitted", "submitted_at": "2026-03-24T22:00:00Z"}
+        self.command("refresh")
+        stop()
+        task["due_at"] = "2026-03-30T10:00:00Z"
+        changed = self.command("refresh")
+        self.service.acknowledge_delivery(changed)
+        self.assertNotIn("Submission priority", self.command("report")["text"])
+        self.assertNotIn("Submission priority", self.service.execute(1234, "tasks", ["stopped"], "telegram", "test")["text"])
+
+    def test_telegram_task_callbacks_are_private_and_paginate(self):
+        from cc_telegram import TelegramBot
+        assignments = self.sc.course[1101]["assignments"]
+        sample = dict(assignments[0])
+        sample.update(due_at="2026-03-27T10:00:00Z", submission={"workflow_state": "unsubmitted"})
+        assignments[:] = [dict(sample, id=10000 + n, name=f"Task {n}") for n in range(20)]
+        self.command("refresh")
+        self.server.requests(clear=True)
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        calls = []
+        bot.request = lambda method, payload=None: calls.append((method, payload))
+        message = lambda uid, data: {"callback_query": {"id": "cb1", "from": {"id": uid},
+                   "message": {"chat": {"id": 1234, "type": "private"}}, "data": data}}
+        bot.handle_update({"message": {"from": {"id": 1234}, "chat": {"id": 1234, "type": "private"}, "text": "/canvas tasks"}})
+        first = calls[-1][1]
+        self.assertEqual(9, len(first["reply_markup"]["inline_keyboard"]))
+        page = first["reply_markup"]["inline_keyboard"][-1][-2]["callback_data"]
+        calls.clear()
+        bot.handle_update({"callback_query": {"id": "cb-group", "from": {"id": 1234},
+                          "message": {"chat": {"id": -1234, "type": "group"}}, "data": page}})
+        self.assertEqual([], calls)
+        bot.handle_update(message(4321, page))
+        self.assertEqual([], calls)
+        bot.handle_update(message(1234, "task:" + "f" * 32))
+        self.assertEqual(["answerCallbackQuery", "sendMessage"], [op for op, _ in calls])
+        calls.clear()
+        bot.handle_update(message(1234, page))
+        self.assertEqual(["answerCallbackQuery", "sendMessage"], [op for op, _ in calls])
+        self.assertIn("9.", calls[-1][1]["text"])
+        self.assertEqual([], self.server.requests())
+
+    def test_concurrent_task_decisions_preserve_both(self):
+        from concurrent.futures import ThreadPoolExecutor
+        sample = dict(self.sc.course[1101]["assignments"][0])
+        sample.update(due_at="2026-03-27T10:00:00Z", submission={"workflow_state": "unsubmitted"})
+        for course in self.sc.course.values():
+            course["assignments"] = []
+        self.sc.course[1101]["assignments"] = [dict(sample, id=901, name="One"), dict(sample, id=902, name="Two")]
+        self.command("refresh")
+        controls = self.command("tasks")["actions"][:2]
+        previews = [self.service.task_action(1234, row[0]["data"]) for row in controls]
+        self.assertIn("One", previews[0]["text"])
+        self.assertIn("Two", previews[1]["text"])
+        confirmations = [preview["actions"][0][0]["data"] for preview in previews]
+        with ThreadPoolExecutor(2) as pool:
+            list(pool.map(lambda token: self.service.task_action(1234, token), confirmations))
+        report = self.command("report")["text"]
+        self.assertNotIn("One", report)
+        self.assertNotIn("Two", report)
+        self.assertIn("One", self.service.execute(1234, "tasks", ["stopped"], "telegram", "test")["text"])
+        self.assertIn("Two", self.service.execute(1234, "tasks", ["stopped"], "telegram", "test")["text"])
+
+    def test_expired_task_confirmation_cannot_change_state(self):
+        sample = self.sc.course[1101]["assignments"][0]
+        sample.update(due_at="2026-03-27T10:00:00Z", submission={"workflow_state": "unsubmitted"})
+        self.command("refresh")
+        selection = self.command("tasks")["actions"][0][0]["data"]
+        confirm = self.service.task_action(1234, selection)["actions"][0][0]["data"]
+        path = Path(self.home.archive, "service-report.json")
+        saved = jload(path)
+        saved["task_buttons"][confirm[5:]]["at"] = 0
+        jsave(path, saved)
+        self.service.task_action(1234, confirm)
+        self.assertNotIn(confirm[5:], jload(path).get("task_buttons", {}))
+        self.assertEqual({}, jload(path).get("reminders", {}))
+
     def test_redirect_and_pagination_never_contact_target(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import threading
@@ -390,6 +533,7 @@ class SecureRefresh(unittest.TestCase):
             due_at="2026-03-27T10:00:00Z", submission={"workflow_state": "unsubmitted"})
         bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
         sent, polls = [], []
+        menus = {}
         def message(identity, kind, text, update_id):
             return {"update_id": update_id, "message": {"from": {"id": identity, "is_bot": False},
                     "chat": {"id": identity, "type": kind}, "text": text}}
@@ -405,7 +549,16 @@ class SecureRefresh(unittest.TestCase):
                 result = {"is_bot": True, "id": 1000, "username": "test_bot"}
             elif method == "getWebhookInfo":
                 result = {"url": ""}
+            elif method in ("setMyCommands", "setChatMenuButton"):
+                menus[method] = payload
+                result = True
             elif method == "getUpdates":
+                self.assertEqual({"type": "chat", "chat_id": 1234}, menus["setMyCommands"]["scope"])
+                self.assertEqual({"chat_id": 1234, "menu_button": {"type": "commands"}}, menus["setChatMenuButton"])
+                commands = menus["setMyCommands"]["commands"]
+                self.assertEqual({"help", "status", "report", "refresh", "tasks"}, {c["command"] for c in commands})
+                for command in commands:
+                    self.assertEqual((command["command"], [], None), bot.parse_command("/" + command["command"]))
                 polls.append(payload)
                 if len(polls) > 1:
                     raise KeyboardInterrupt
