@@ -22,7 +22,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import brand
-from cc_account import COMMANDS
+from cc_account import COMMANDS, _SwitchFailure
 from cc_service_security import _StrictNoRedirectHandler
 from cc_store import FileLock
 REFRESH_ACK = "正在刷新 Canvas 数据，请稍候…"
@@ -153,7 +153,7 @@ class TelegramBot:
 
         return res.get("result")
 
-    def send(self, text: str, actions=None) -> None:
+    def send(self, text: str, actions=None, permit=None) -> bool:
         """Sends sanitized text to the fixed bound chat (self.service.user_id).
 
         Neutralizes @ and control/bidi characters, splits BEFORE escaping into chunks
@@ -161,11 +161,13 @@ class TelegramBot:
         and disables link previews without reply_markup.
         """
         if not text:
-            return
+            return False
 
         cleaned = _neutralize(text)
         chunks = _split_utf16_units(cleaned, max_units=MAX_UTF16_CHUNK)
         for index, chunk in enumerate(chunks):
+            if permit is not None and not permit():
+                return False
             if not chunk:
                 continue
             escaped = html.escape(chunk)
@@ -180,6 +182,7 @@ class TelegramBot:
                 payload["reply_markup"] = {"inline_keyboard": [[{"text": _neutralize(button["text"]), "callback_data": button["data"]}
                                                                 for button in row] for row in actions]}
             self.request("sendMessage", payload)
+        return True
 
     def parse_command(self, text: str) -> tuple[str | None, list[str], str | None]:
         parts = text.strip().split()
@@ -270,30 +273,44 @@ class TelegramBot:
         if not cmd:
             return
 
-        if cmd == "refresh":
+        generation = self.service.generation()
+        if cmd == "refresh" and self.service.permitted(generation):
             self.send(REFRESH_ACK)
-        if cmd == "refresh" and executor is not None:
-            executor.submit(self._execute_command, configured_uid, cmd, params, str(update_id))
+        if cmd in ("refresh", "on") and executor is not None:
+            executor.submit(self._execute_command, configured_uid, cmd, params, str(update_id), generation)
         else:
-            self._execute_command(configured_uid, cmd, params, str(update_id))
+            self._execute_command(configured_uid, cmd, params, str(update_id), generation)
 
-    def _execute_command(self, identity, command, params, correlation_id):
-        try:
-            result = self.service.execute(
-                identity=identity, command=command, params=params,
-                channel="telegram", correlation_id=correlation_id,
-            )
-        except Exception:
-            self.send(REFRESH_FAIL if command == "refresh" else GENERIC_OP_FAIL)
+    def _execute_command(self, identity, command, params, correlation_id, expected_generation=None):
+        generation = self.service.generation() if expected_generation is None else expected_generation
+        if expected_generation is not None and self.service.generation() != generation:
             return
         try:
-            # Serialize report delivery, not collection. Re-read under the delivery
-            # lock so overlapping commands cannot repeat acknowledged changes.
+            options = {"expected_generation": generation} if command in ("on", "refresh") else {}
+            result = self.service.execute(identity=identity, command=command, params=params,
+                                          channel="telegram", correlation_id=correlation_id, **options)
+        except _SwitchFailure as failure:
+            self.send(GENERIC_OP_FAIL, permit=lambda: self.service.permitted(failure.generation))
+            return
+        except Exception:
+            if command != "on" or self.service.generation() == generation:
+                permit = (lambda: self.service.permitted(generation)) if command == "refresh" else None
+                self.send(REFRESH_FAIL if command == "refresh" else GENERIC_OP_FAIL, permit=permit)
+            return
+        if result.get("stale"):
+            return
+        try:
             with FileLock(os.path.join(self.service.home, "service-telegram-delivery.lock")):
-                if command in ("refresh", "report"):
+                if command in ("refresh", "report") and self.service.permitted(generation):
                     result = self.service.execute(identity, "report", [], "telegram", correlation_id)
-                self.send(result["text"], result.get("actions"))
-                self.service.acknowledge_delivery(result)
+                if command == "on":
+                    generation = result["generation"]
+                permit = (lambda: self.service.permitted(generation)) if command == "on" or command == "refresh" and result.get("delivery") else None
+                sent = self.send(result["text"], result.get("actions"), permit=permit)
+                if sent:
+                    self.service.acknowledge_delivery(result)
+            if command == "on" and result.get("resume_delivery") and sent:
+                self._scheduled_once()
         except Exception:
             sys.stderr.write("Telegram 命令处理或投递失败；可重新请求快照。\n")
 
@@ -303,11 +320,12 @@ class TelegramBot:
                 due = self.service.scheduled_tick()
                 if due:
                     try:
-                        self.send(due["text"])
+                        sent = self.send(due["text"], permit=lambda: self.service.permitted(due["generation"]))
                     except Exception:
-                        self.service.scheduled_delivery(due["day"], False)
+                        self.service.scheduled_delivery(due["day"], False, due["generation"])
                         return
-                    self.service.scheduled_delivery(due["day"], True)
+                    if sent:
+                        self.service.scheduled_delivery(due["day"], True, due["generation"])
         except Exception:
             sys.stderr.write("Telegram 每日扫描或投递失败；将继续重试。\n")
 

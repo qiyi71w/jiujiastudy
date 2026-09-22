@@ -587,7 +587,7 @@ class SecureRefresh(unittest.TestCase):
                 self.assertEqual({"type": "chat", "chat_id": 1234}, menus["setMyCommands"]["scope"])
                 self.assertEqual({"chat_id": 1234, "menu_button": {"type": "commands"}}, menus["setChatMenuButton"])
                 commands = menus["setMyCommands"]["commands"]
-                self.assertEqual({"help", "status", "report", "refresh", "tasks", "schedule"}, {c["command"] for c in commands})
+                self.assertEqual({"help", "status", "report", "refresh", "tasks", "schedule", "on", "off"}, {c["command"] for c in commands})
                 for command in commands:
                     self.assertEqual((command["command"], [], None), bot.parse_command("/" + command["command"]))
                 polls.append(payload)
@@ -798,6 +798,196 @@ class SecureRefresh(unittest.TestCase):
                 self.assertEqual("2026-03-24", daily.result(timeout=5)["day"])
         requests = [r for r in self.server.requests() if r["path"] == "/api/v1/users/self"]
         self.assertEqual(1, len(requests))
+
+    def test_off_retains_management_and_prevents_collection_across_restart(self):
+        self.command("refresh")
+        task = self.service.task_list(1234)["actions"][0][0]["data"]
+        self.assertIn("已关闭", self.command("off")["text"])
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        self.server.requests(clear=True)
+        self.assertIn("已关闭", self.command("status", restarted)["text"])
+        self.assertIn("已关闭", self.command("refresh", restarted)["text"])
+        self.assertIn("数据截至", self.command("report", restarted)["text"])
+        confirmation = restarted.task_action(1234, task)
+        self.assertTrue(confirmation["actions"])
+        confirmed = restarted.task_action(1234, confirmation["actions"][0][0]["data"])
+        self.assertIn("已停止提醒", confirmed["text"])
+        self.assertIn("每日计划", restarted.execute(1234, "schedule", ["08:30", "UTC"], "telegram", "change")["text"])
+        self.assertIsNone(restarted.scheduled_tick())
+        self.assertEqual([], self.server.requests())
+        self.assertIn("已关闭", self.command("off", restarted)["text"])
+
+    def test_off_during_canvas_pagination_and_fast_on_discards_old_result(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        self.sc.opts["max_per_page"] = 1
+        entered, release = threading.Event(), threading.Event()
+        original = SecureCanvas.fetch
+        def pause_after_first_page(api, url, accept="application/json"):
+            result = original(api, url, accept)
+            if "/api/v1/courses?" in url and "&page=" not in url and not entered.is_set():
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return result
+        with patch.object(SecureCanvas, "fetch", pause_after_first_page), ThreadPoolExecutor(max_workers=2) as pool:
+            old = pool.submit(self.command, "refresh")
+            self.assertTrue(entered.wait(5))
+            self.command("off")
+            self.assertEqual(1, sum(r["path"] == "/api/v1/courses" for r in self.server.requests()))
+            new = pool.submit(self.command, "on")
+            release.set()
+            old_result = old.result(timeout=5)
+            self.assertNotIn("Canvas 规则日报", old_result["text"])
+            self.assertIn("形成当日计划日报", new.result(timeout=5)["text"])
+        self.assertEqual(2, sum(r["path"] == "/api/v1/users/self" for r in self.server.requests()))
+        self.assertEqual(len(self.sc.courses) + 1, sum(r["path"] == "/api/v1/courses" for r in self.server.requests()))
+
+
+    def test_on_forms_unformed_day_but_resumes_formed_delivery_without_recollect(self):
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        self.command("off")
+        self.server.requests(clear=True)
+        first = self.command("on")
+        self.assertIn("形成当日计划日报", first["text"])
+        self.assertGreater(len(self.server.requests()), 0)
+        due = self.service.scheduled_tick()
+        self.assertIsNotNone(due)
+        self.assertEqual("formed", jload(self.service.report_path)["daily_plans"][due["day"]]["state"])
+        self.service.scheduled_delivery(due["day"], True, due["generation"])
+        self.command("off")
+        self.server.requests(clear=True)
+        second = self.command("on")
+        self.assertGreater(len(self.server.requests()), 0, "on refreshes even after today's report was formed")
+        self.assertIsNone(self.service.scheduled_tick(), "already sent channel is not redelivered")
+        self.server.requests(clear=True)
+        self.assertIn("已开启", self.command("on")["text"])
+        self.assertEqual([], self.server.requests())
+
+    def test_on_refreshes_and_delivers_only_pending_formed_report(self):
+        from cc_telegram import TelegramBot
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        formed = self.service.scheduled_tick()
+        self.assertIsNotNone(formed)
+        self.command("off")
+        sent = []
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        with patch.object(bot, "request", side_effect=lambda method, payload: sent.append((method, payload))):
+            bot._execute_command(1234, "on", [], "switch")
+        texts = [payload["text"] for method, payload in sent if method == "sendMessage"]
+        self.assertTrue(any("立即采集" in text for text in texts))
+        self.assertTrue(any("Canvas 规则日报" in text for text in texts))
+        self.assertEqual("sent", jload(self.service.report_path)["daily_plans"][formed["day"]]["delivery"]["telegram"]["state"])
+        self.server.requests(clear=True)
+        bot._scheduled_once()
+        self.assertIsNone(self.service.scheduled_tick())
+        self.assertEqual([], self.server.requests())
+
+    def test_on_before_due_delivers_daily_report_immediately(self):
+        from cc_telegram import TelegramBot
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["23:55", "UTC"], "telegram", "setting")
+        self.command("off")
+        sent = []
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        with patch.object(bot, "request", side_effect=lambda method, payload: sent.append((method, payload))):
+            bot._execute_command(1234, "on", [], "early")
+        self.assertTrue(any("Canvas 规则日报" in p["text"] for m, p in sent if m == "sendMessage"))
+        plan = jload(self.service.report_path)["daily_plans"]["2026-03-24"]
+        self.assertEqual("sent", plan["delivery"]["telegram"]["state"])
+        self.assertIsNone(self.service.scheduled_tick())
+
+    def test_old_on_worker_cannot_reply_after_off(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from cc_telegram import TelegramBot
+        import threading
+        self.command("off")
+        entered, release = threading.Event(), threading.Event()
+        original = SecureCanvas.fetch
+        def pause(api, url, accept="application/json"):
+            result = original(api, url, accept)
+            if "/api/v1/users/self" in url and not entered.is_set():
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return result
+        sent = []
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        with patch.object(bot, "request", side_effect=lambda method, payload: sent.append((method, payload))), patch.object(SecureCanvas, "fetch", pause), ThreadPoolExecutor(2) as pool:
+            old = pool.submit(bot._execute_command, 1234, "on", [], "old")
+            self.assertTrue(entered.wait(5))
+            bot._execute_command(1234, "off", [], "off")
+            count = len(sent)
+            release.set()
+            old.result(timeout=5)
+        self.assertEqual(count, len(sent))
+        self.assertIn("服务：已关闭", self.command("status")["text"])
+
+    def test_help_states_refresh_availability_when_off(self):
+        self.command("off")
+        help_text = self.command("help")["text"]
+        refresh = next(line for line in help_text.splitlines() if line.startswith("/canvas refresh"))
+        self.assertIn("开启", refresh)
+        self.assertIn("关闭", next(line for line in help_text.splitlines() if line.startswith("/canvas report")))
+
+    def test_queued_on_before_off_does_not_reopen_or_send(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from cc_telegram import TelegramBot
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        def block():
+            entered.set()
+            self.assertTrue(release.wait(5))
+        sent = []
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        update = {"update_id": 41, "message": {"from": {"id": 1234}, "chat": {"id": 1234, "type": "private"}, "text": "/canvas on"}}
+        with patch.object(bot, "request", side_effect=lambda method, payload: sent.append((method, payload))), ThreadPoolExecutor(1) as pool:
+            blocked = pool.submit(block)
+            self.assertTrue(entered.wait(5))
+            bot.handle_update(update, pool)
+            bot._execute_command(1234, "off", [], "off")
+            count = len(sent)
+            release.set()
+            blocked.result(timeout=5)
+        self.assertEqual(count, len(sent))
+        self.assertIn("服务：已关闭", self.command("status")["text"])
+        self.assertEqual([], self.server.requests())
+
+    def test_duplicate_on_result_waiting_to_send_is_invalidated(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from cc_telegram import TelegramBot
+        import threading
+        from cc_store import FileLock
+        returned = threading.Event()
+        original = self.service.execute
+        def observe(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kwargs.get("command") == "on":
+                returned.set()
+            return result
+        sent = []
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        lock = FileLock(os.path.join(self.home.archive, "service-telegram-delivery.lock"))
+        lock.acquire()
+        try:
+            with patch.object(bot, "request", side_effect=lambda method, payload: sent.append((method, payload))), patch.object(self.service, "execute", observe), ThreadPoolExecutor(1) as pool:
+                old = pool.submit(bot._execute_command, 1234, "on", [], "duplicate")
+                self.assertTrue(returned.wait(5))
+                self.command("off")
+                lock.release()
+                old.result(timeout=5)
+        finally:
+            lock.release()
+        self.assertEqual([], sent)
+
+    def test_current_on_failure_replies_but_superseded_failure_does_not(self):
+        from cc_telegram import TelegramBot
+        self.command("off")
+        sent = []
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        with patch.object(bot, "request", side_effect=lambda method, payload: sent.append((method, payload))), patch.object(self.service, "_collect", side_effect=RuntimeError("synthetic failure")):
+            bot._execute_command(1234, "on", [], "failure")
+        self.assertTrue(sent, "current failed on must reply")
 
 if __name__ == "__main__":
     unittest.main()

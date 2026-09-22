@@ -13,14 +13,25 @@ from cc_schedule import ensure_plan, planned, settings
 from cc_store import FileLock, jload, jsave
 from cc_time import parse_ts
 
+class _StaleOperation(Exception):
+    """The account changed service generation during this operation."""
+
+
+class _SwitchFailure(Exception):
+    def __init__(self, generation):
+        self.generation = generation
+
+
 
 COMMANDS = {
-    "help": "显示命令及用途，不访问 Canvas",
-    "status": "查看服务及快照状态，不访问 Canvas",
-    "report": "查看当前快照日报及数据时间，不访问 Canvas",
-    "refresh": "立即重新采集并生成规则日报",
-    "tasks": "查看任务、已停止项和确认按钮；/canvas tasks stopped 查看已停止项，不访问 Canvas",
-    "schedule": "设置每日基准时间及 IANA 时区：/canvas schedule HH:MM Area/City",
+    "help": "显示全部命令及可用条件；关闭时也可用，不访问 Canvas",
+    "status": "查看服务及快照状态；关闭时也可用，不访问 Canvas",
+    "report": "查看当前快照日报及数据时间；关闭时也可用，不访问 Canvas",
+    "refresh": "仅服务开启时立即重新采集并生成规则日报；关闭时拒绝",
+    "tasks": "查看任务、已停止项和确认按钮；/canvas tasks stopped 查看已停止项；关闭时也可用，不访问 Canvas",
+    "schedule": "设置每日基准时间及 IANA 时区：/canvas schedule HH:MM Area/City；关闭时也可用",
+    "on": "开启服务，立即采集并恢复当日计划；已开启时不重复采集",
+    "off": "暂停采集、AI 和日报；仍可查看旧报告及管理设置",
 
 }
 
@@ -86,6 +97,19 @@ class AccountService:
             return saved
         return None
 
+    def generation(self):
+        saved = self._saved() or {}
+        return saved.get("service_generation", 0)
+
+    def permitted(self, generation):
+        saved = self._saved() or {}
+        return saved.get("service_enabled", True) and saved.get("service_generation", 0) == generation
+
+    def _require(self, generation):
+        if not self.permitted(generation):
+            raise _StaleOperation()
+
+
     @staticmethod
     def _result(text, saved=None):
         saved = saved or {}
@@ -109,6 +133,8 @@ class AccountService:
 
     def next_scan(self, ctx):
         with FileLock(os.path.join(self.home, "service-state.lock")):
+            if not (self._saved() or {}).get("service_enabled", True):
+                return "已暂停"
             saved = self._plan(ctx, self._saved())
             clock, zone, tz = settings(ctx.cfg)
             now = ctx.clock.now_utc()
@@ -146,12 +172,87 @@ class AccountService:
                     jsave(self.report_path, saved)
         return self._result("每日计划已更新；实际下一次：" + self.next_scan(_CollectionContext(self.home, quiet=True)))
 
+    def switch(self, ctx, enabled, expected_generation=None):
+        """Persist the generation before acknowledging a transition."""
+        now = ctx.clock.now_utc()
+        day = None
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved() or {"binding": self.binding}
+            if enabled and expected_generation is not None and saved.get("service_generation", 0) != expected_generation:
+                return {**self._result("本次开启已失效。"), "stale": True}
+            if saved.get("service_enabled", True) == enabled:
+                result = self._result("服务已开启。" if enabled else "服务已关闭。", saved)
+                if enabled:
+                    result["generation"] = saved.get("service_generation", 0)
+                return result
+            saved["service_enabled"] = enabled
+            saved["service_generation"] = uuid.uuid4().hex
+            generation = saved["service_generation"]
+            if enabled:
+                saved = self._plan(ctx, saved)
+                _, eligible = ensure_plan(saved, ctx.cfg, now)
+                tz = settings(ctx.cfg)[2]
+                formed_today = any(p.get("state") == "formed" and p.get("formed_at") and
+                                   dt.datetime.fromisoformat(p["formed_at"]).astimezone(tz).date() == now.astimezone(tz).date()
+                                   for p in saved["daily_plans"].values())
+                for key in eligible:
+                    plan = saved["daily_plans"][key]
+                    if plan["state"] == "formed":
+                        for receipt in plan.get("delivery", {}).values():
+                            if receipt["state"] == "pending":
+                                receipt["next_at"] = now.isoformat()
+                                receipt["attempts"] = 0
+                    elif not formed_today and day is None and plan["state"] in ("pending", "cancelled", "collecting"):
+                        plan["state"] = "collecting"
+                        plan["claimed_at"] = now.isoformat()
+                        day = key
+            else:
+                for plan in saved.get("daily_plans", {}).values():
+                    if plan["state"] == "collecting":
+                        plan["state"] = "cancelled"
+            jsave(self.report_path, saved)
+        try:
+            collected = self._collect(plan_day=day, generation=generation) if enabled else saved
+            if enabled and not self.permitted(generation):
+                return {**self._result("本次开启已失效。"), "stale": True}
+            if enabled:
+                if day is not None:
+                    with FileLock(os.path.join(self.home, "service-state.lock")):
+                        latest = self._saved()
+                        if not self.permitted(generation):
+                            return {**self._result("本次开启已失效。"), "stale": True}
+                        plan = latest["daily_plans"][day]
+                        if plan["state"] == "formed":
+                            for receipt in plan.get("delivery", {}).values():
+                                if receipt["state"] == "pending":
+                                    receipt["next_at"] = now.isoformat()
+                            jsave(self.report_path, latest)
+                            collected = latest
+                result = self._report_result(_CollectionContext(self.home, quiet=True), collected)
+                if day is None:
+                    result["text"] = "服务已开启；已立即采集。\n" + result["text"]
+                if day is not None and collected.get("daily_plans", {}).get(day, {}).get("state") == "formed":
+                    result["text"] = ("服务已开启；立即采集已形成当日计划日报，正在投递。数据截至：" +
+                                      str(collected.get("collected_at") or "尚无成功数据"))
+                result["generation"] = generation
+                result["resume_delivery"] = True
+                return result
+            return self._result("服务已关闭；已暂停后续采集及日报。", saved)
+        except Exception:
+            if enabled:
+                raise _SwitchFailure(generation) from None
+            raise
+
     def scheduled_tick(self):
-        """Claim a due plan; a persisted report is delivered without Canvas access."""
+        """Claim a due plan; formed reports remain deliverable without another scan."""
         ctx = self._authorized(self.user_id)
         now = ctx.clock.now_utc()
         with FileLock(os.path.join(self.home, "service-state.lock")):
-            saved = self._plan(ctx, self._saved())
+            saved = self._saved() or {}
+            if not saved.get("service_enabled", True):
+                return None
+            generation = saved.get("service_generation", 0)
+            saved = self._plan(ctx, saved)
             _, eligible = ensure_plan(saved, ctx.cfg, now)
             for day in eligible:
                 plan = saved["daily_plans"][day]
@@ -159,7 +260,7 @@ class AccountService:
                     lock = FileLock(os.path.join(self.home, "service-refresh.lock"))
                     if lock.acquire(blocking=False):
                         lock.release()
-                        plan["state"] = "pending"  # interrupted before a report was committed
+                        plan["state"] = "pending"
                 if plan["state"] == "pending" and plan["due"] <= now.isoformat():
                     plan["state"] = "collecting"
                     plan["claimed_at"] = now.isoformat()
@@ -168,19 +269,18 @@ class AccountService:
             else:
                 day = None
                 jsave(self.report_path, saved)
-        if day is not None:
-            with FileLock(os.path.join(self.home, "service-state.lock")):
-                pending = self._saved()["daily_plans"][day]["state"] == "collecting"
-            if pending:
-                self._collect(plan_day=day)
+        if day is not None and self.permitted(generation):
+            self._collect(plan_day=day, generation=generation)
         with FileLock(os.path.join(self.home, "service-state.lock")):
             saved = self._saved() or {}
+            if not self.permitted(generation):
+                return None
             _, eligible = ensure_plan(saved, ctx.cfg, now)
             for key in eligible:
                 plan = saved["daily_plans"][key]
                 delivery = plan.get("delivery", {}).get("telegram")
                 if plan["state"] == "formed" and delivery and delivery["state"] == "pending" and delivery["attempts"] < 4 and delivery["next_at"] <= now.isoformat():
-                    return {"day": key, "text": plan["text"]}
+                    return {"day": key, "text": plan["text"], "generation": generation}
         return None
 
     def cancel_scheduled(self):
@@ -198,9 +298,11 @@ class AccountService:
                 jsave(self.report_path, saved)
 
 
-    def scheduled_delivery(self, day, success):
+    def scheduled_delivery(self, day, success, generation=None):
         with FileLock(os.path.join(self.home, "service-state.lock")):
             saved = self._saved()
+            if generation is not None and not self.permitted(generation):
+                return
             plan = (saved or {}).get("daily_plans", {}).get(day)
             if not plan or plan["state"] != "formed":
                 return
@@ -349,7 +451,7 @@ class AccountService:
         return self.task_list(identity, *page_request)
 
 
-    def execute(self, identity, command, params, channel, correlation_id):
+    def execute(self, identity, command, params, channel, correlation_id, expected_generation=None):
         # Recheck administrator configuration before every operation, including reads.
         ctx = _CollectionContext(self.home, quiet=True)
         secrets = ServiceSecrets(ctx.cfg, self.secrets_path)
@@ -363,7 +465,7 @@ class AccountService:
             return {**self._result("\n".join(f"/canvas {name} — {description}" for name, description in COMMANDS.items()) + "\n设置入口：/canvas schedule HH:MM Area/City"),
                     "actions": [[{"text": "每日扫描设置", "data": "schedule:help"}]]}
         if command == "status":
-            text = "服务：每日扫描；渠道：Telegram 私聊；AI：未启用。\n"
+            text = ("服务：每日扫描；" if (saved or {}).get("service_enabled", True) else "服务：已关闭；") + "渠道：Telegram 私聊；AI：未启用。\n"
             text += (f"数据截至：{saved.get('collected_at') or '尚无成功数据'}；完整性："
                      + ("完整。" if self._result("", saved)["complete"] else "不完整。")
                      if saved else "尚无成功快照；使用 /canvas refresh。")
@@ -375,15 +477,27 @@ class AccountService:
             return self.set_schedule(ctx, params)
         if command == "tasks":
             return self.task_list(identity, stopped=bool(params))
-        saved = self._collect()
-        return self._report_result(_CollectionContext(self.home, quiet=True), saved)
+        if command == "off":
+            return self.switch(ctx, False)
+        if command == "on":
+            return self.switch(ctx, True, expected_generation)
+        generation = self.generation() if expected_generation is None else expected_generation
+        if not self.permitted(generation):
+            return self._result("服务已关闭；/canvas refresh 和 AI 不可用，请使用 /canvas on 开启。", saved)
+        collected = self._collect(generation=generation)
+        if not self.permitted(generation):
+            return {**self._result("本次采集已失效；服务状态已变化。"), "stale": True}
+        return self._report_result(_CollectionContext(self.home, quiet=True), collected)
 
-    def _collect(self, plan_day=None):
+    def _collect(self, plan_day=None, generation=None):
         """Purpose-neutral collection; only validated commands may join it.
 
         The persisted attempt id distinguishes joining an in-flight request from
         a later request. Waiting spans processes too; no application cooldown.
         """
+        if generation is None:
+            generation = self.generation()
+        self._require(generation)
         before = self._saved() or {}
         attempt_id = before.get("last_attempt", {}).get("id")
         lock = FileLock(os.path.join(self.home, "service-refresh.lock"))
@@ -396,25 +510,29 @@ class AccountService:
             if self._binding(secrets) != self.binding:
                 raise ValueError("账号绑定已变更，请管理员重启服务")
             saved = self._saved()
+            self._require(generation)
             if plan_day and saved and saved.get("daily_plans", {}).get(plan_day, {}).get("state") != "collecting":
                 return saved
             if joined and saved and saved.get("last_attempt", {}).get("id") != attempt_id:
                 return saved
             try:
-                return self._refresh(ctx, secrets, saved)
+                return self._refresh(ctx, secrets, saved, generation)
+            except _StaleOperation:
+                return self._saved()
             except Exception:
-                # Never persist raw errors, URLs, response content or credentials.
-                return self._failed(ctx, self._saved(), [{"course": None, "kind": "collection"}])
+                self._require(generation)
+                return self._failed(ctx, self._saved(), [{"course": None, "kind": "collection"}], generation)
         finally:
             lock.release()
 
-    def _failed(self, ctx, previous, failures):
-        return self._commit(ctx, previous, None, [], failures)
+    def _failed(self, ctx, previous, failures, generation):
+        return self._commit(ctx, previous, None, [], failures, generation)
 
-    def _commit(self, ctx, previous, snap, course_changes, failures):
+    def _commit(self, ctx, previous, snap, course_changes, failures, generation):
         # Collection and delivery have separate locks: a late send acknowledgement
         # must not be overwritten by a refresh that was already doing network IO.
         with FileLock(ctx.P("service-state.lock")):
+            self._require(generation)
             latest = self._saved()
             if latest and previous and (not latest.get("canvas_user_id") or latest.get("canvas_user_id") == previous.get("canvas_user_id")):
                 saved = dict(latest)
@@ -490,8 +608,8 @@ class AccountService:
             if changed:
                 append("submitted", label)
 
-    def _refresh(self, ctx, secrets, previous):
-        api = SecureCanvas(secrets.canvas_origin, secrets.canvas_token)
+    def _refresh(self, ctx, secrets, previous, generation):
+        api = SecureCanvas(secrets.canvas_origin, secrets.canvas_token, permit=lambda: self._require(generation))
         who = api.get("/api/v1/users/self")
         if not isinstance(who, dict) or not who.get("id"):
             raise ValueError("Canvas 身份验证失败")
@@ -501,8 +619,9 @@ class AccountService:
         previous["canvas_user_id"] = who["id"]
         errors = []
         changes = refresh_courses(ctx, api, errors)
+        self._require(generation)
         if errors:
-            return self._failed(ctx, previous, [{"course": None, "kind": "course_list"}])
+            return self._failed(ctx, previous, [{"course": None, "kind": "course_list"}], generation)
         courses = course_pairs(ctx.cfg, include_inactive=False)
         assignments, failures = {}, []
         for cid, code in courses:
@@ -511,10 +630,14 @@ class AccountService:
                 if not isinstance(values, list) or any(not isinstance(a, dict) or not a.get("id") for a in values):
                     raise ValueError("作业采集失败")
                 assignments[code] = values
+            except _StaleOperation:
+                raise
             except Exception:
                 failures.append({"course": code, "kind": "assignments"})
         if courses and not assignments:
-            result = self._commit(ctx, previous, None, changes, failures)
+            self._require(generation)
+            result = self._commit(ctx, previous, None, changes, failures, generation)
+            self._require(generation)
             jsave(ctx.P("config.json"), ctx.raw_cfg)
             return result
         snap = snapshot_from(courses, assignments, {}, {}, {}, {})
@@ -537,7 +660,9 @@ class AccountService:
         freshness.update({code: now for code in assignments})
         snap.update(collected_at=now, complete=not failures, course_freshness=freshness,
                     baseline=not bool(old))
-        result = self._commit(ctx, previous, snap, changes, failures)
+        self._require(generation)
+        result = self._commit(ctx, previous, snap, changes, failures, generation)
+        self._require(generation)
         jsave(ctx.P("config.json"), ctx.raw_cfg)
         return result
 

@@ -184,12 +184,13 @@ class ServiceSecrets:
 class SecureCanvas(canvas_api.Canvas):
     """Restricted Canvas API client subclass enforcing same-origin HTTPS /api/v1/ requests."""
 
-    def __init__(self, host, tok, timeout=120, max_pages=50, retries=2):
+    def __init__(self, host, tok, timeout=120, max_pages=50, retries=2, permit=None):
         self.origin = ServiceSecrets._canonical_origin(host)
         if not isinstance(tok, str) or not tok.strip():
             raise ValueError("Canvas token is required")
         super().__init__(self.origin, tok.strip(), timeout, max_pages, retries)
         self.opener = urllib.request.build_opener(_StrictNoRedirectHandler())
+        self.permit = permit
     def _decode_payload(self, url, body):
         payload = super()._decode_payload(url, body)
         path = urllib.parse.urlsplit(url).path
@@ -267,6 +268,8 @@ class SecureCanvas(canvas_api.Canvas):
         delay = 2
         for attempt in range(self.retries + 1):
             try:
+                if self.permit is not None:
+                    self.permit()
                 req = urllib.request.Request(url, headers=headers)
                 with self.opener.open(req, timeout=self.timeout) as r:
                     return r.headers, r.read()

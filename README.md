@@ -111,13 +111,14 @@ Linux/POSIX、Python 3.10+，仅用标准库；每个 Canvas 账号使用独立�
    python3 -B tools/cc_telegram.py --home /srv/canvas-account/data --secrets /srv/canvas-account-private/service.json
    ```
 
-支持 `/canvas help`、`/canvas status`、`/canvas report`（已有快照）、`/canvas refresh`（立即采集）、`/canvas tasks`（任务按钮）及 `/canvas schedule HH:MM Area/City`（每日基准时间和 IANA 显示时区）；`/canvas tasks stopped` 查看已停止项。也可直接使用 `/help`、`/schedule` 等命令。help 和 status 都列出设置入口；status 显示当地实际计划时刻及最近采集完整性，不访问 Canvas。默认基准时间为 09:00 UTC，初次设置后延迟在 0–15 分钟内抽取。重叠刷新复用进行中的采集，结束后的新请求立即允许，仍遵守 Canvas 服务端限流。未授权私聊和群聊静默忽略。
+支持 `/canvas help`、`/canvas status`、`/canvas report`（已有快照）、`/canvas refresh`（立即采集）、`/canvas on` / `/canvas off`（账号服务开关）、`/canvas tasks`（任务按钮）及 `/canvas schedule HH:MM Area/City`（每日基准时间和 IANA 显示时区）；`/canvas tasks stopped` 查看已停止项。也可直接使用 `/help`、`/on`、`/off` 等命令。help 和 status 都列出设置入口；status 显示服务开关、当地实际计划时刻及最近采集完整性，不访问 Canvas。默认基准时间为 09:00 UTC，初次设置后延迟在 0–15 分钟内抽取。重叠刷新复用进行中的采集，结束后的新请求立即允许，仍遵守 Canvas 服务端限流。未授权私聊和群聊静默忽略。
 
-启动时从同一命令目录注册绑定用户私聊的原生命令菜单；点击输入框旁菜单可选择 `/help`、`/status`、`/report`、`/refresh`、`/tasks`、`/schedule`。菜单不改变命令鉴权，不向其他私聊或群聊注册。
+启动时从同一命令目录注册绑定用户私聊的原生命令菜单；点击输入框旁菜单可选择 `/help`、`/status`、`/report`、`/refresh`、`/on`、`/off`、`/tasks`、`/schedule`。菜单不改变命令鉴权，不向其他私聊或群聊注册。
 
 `service-report.json` 原子保存当前及上一成功快照、逐课数据时间、最近采集完整性、待通知变化、每个计划日的随机时刻及逐端投递状态。部分失败保留成功课的更新与失败课的旧数据时间；全部失败不推进任务快照，但形成明确标注失败的定时日报。日报包含未来七天待交、逾期未交、日期不明任务、新增改期、最近已提交及新课程，保留来源链接和逐课采集时间。没有待交任务且采集完整时仍给出确认。
 
 每门课首次成功采集作为任务基线。定时日报形成后固定正文，Telegram 投递故障只重投正文，不重扫 Canvas；最多重试四次，超时回执可能造成重复，不承诺严格只送一次。手动查看确认不消费未来定时日报的变化记录。过期计划不补发多日历史；保留执行事实与未送达变化，已完成的旧日报正文可清理。课程首次采集、设置变化和手动刷新不使已扫描的计划日再次采集。
+`/canvas off` 先保存关闭状态和失效代际，再确认；Bot 继续响应 help、status、标明数据时间的旧 report、任务停止/恢复及扫描设置，但不再采集或投递日报。已发出的请求和消息不能撤回；慢请求返回后不继续分页、提交快照或发送旧结果。`/canvas on` 从关闭状态立即采集；若当天未形成有效计划日报，则这次采集形成并投递当日日报；当天已形成则仅向发起私聊回复本次刷新，另外恢复原日报未成功端的投递，不重发成功端。重复 on/off 不触发采集。关闭期间不追发多日历史。
 
 提交状态以 Canvas 证据为准：已提交未评分、待审阅和豁免不催交；仅有分数不代表已提交，线下及无法确认的状态标记需确认。个人延期使用 Canvas 为请求用户返回的 `due_at`；仅改期不使已提交任务恢复催交，明确的 `redo_request` 才表示要求重新提交。学习完成记录和本地备注不替代提交状态。正文按 Telegram 长度分段，课程文字以转义的预格式文本呈现，来源 URL 保留供打开或复制。
 
