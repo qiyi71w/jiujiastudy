@@ -478,6 +478,37 @@ class SecureRefresh(unittest.TestCase):
         self.assertNotIn(confirm[5:], jload(path).get("task_buttons", {}))
         self.assertEqual({}, jload(path).get("reminders", {}))
 
+    def test_task_button_from_other_account_cannot_read_or_change_state(self):
+        self.sc.course[1101]["assignments"][0].update(
+            name="Private task", due_at="2026-03-27T10:00:00Z",
+            submission={"workflow_state": "unsubmitted"})
+        target = self.sc.course[1101]["assignments"][0]
+        for course in self.sc.course.values():
+            course["assignments"] = []
+        self.sc.course[1101]["assignments"] = [target]
+        self.command("refresh")
+        token = self.command("tasks")["actions"][0][0]["data"]
+        other_home = harness.FakeHome("other-account")
+        self.addCleanup(other_home.cleanup)
+        other_home.seed(self.sc, self.origin)
+        cfg_path = Path(other_home.archive, "config.json")
+        cfg = jload(cfg_path)
+        cfg["service"] = {"telegram_user_id": 5678}
+        jsave(cfg_path, cfg)
+        other_secrets = Path(other_home.tmp, "service.json")
+        jsave(other_secrets, {"canvas_origin": self.origin, "canvas_token": self.sc.token,
+                              "telegram_bot_token": "2000:" + "y" * 35})
+        os.chmod(other_secrets, 0o600)
+        other = AccountService(other_home.archive, str(other_secrets))
+        other.execute(5678, "refresh", [], "telegram", "other-refresh")
+        before = jload(other.report_path)
+        rejected = other.task_action(5678, token)
+        self.assertNotIn("Private task", rejected["text"])
+        self.assertEqual(before, jload(other.report_path))
+        with self.assertRaises(ValueError):
+            other.task_action(1234, token)
+        self.assertIn("Private task", self.service.task_action(1234, token)["text"])
+
     def test_redirect_and_pagination_never_contact_target(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import threading
