@@ -14,6 +14,7 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +24,7 @@ if _HERE not in sys.path:
 import brand
 from cc_account import COMMANDS
 from cc_service_security import _StrictNoRedirectHandler
+from cc_store import FileLock
 REFRESH_ACK = "正在刷新 Canvas 数据，请稍候…"
 REFRESH_FAIL = "刷新失败，本次未生成完整日报；上次成功快照保留。"
 GENERIC_OP_FAIL = "操作失败，请稍后重试。"
@@ -196,7 +198,7 @@ class TelegramBot:
             return None, [], "该命令不接受参数。"
         return command, [], None
 
-    def handle_update(self, update: dict) -> None:
+    def handle_update(self, update: dict, executor=None) -> None:
         """Handles an incoming Telegram update.
 
         Authenticates that message from.id == service.user_id, chat.id == service.user_id,
@@ -246,17 +248,30 @@ class TelegramBot:
 
         if cmd == "refresh":
             self.send(REFRESH_ACK)
+        if cmd == "refresh" and executor is not None:
+            executor.submit(self._execute_command, configured_uid, cmd, params, str(update_id))
+        else:
+            self._execute_command(configured_uid, cmd, params, str(update_id))
+
+    def _execute_command(self, identity, command, params, correlation_id):
         try:
             result = self.service.execute(
-                identity=configured_uid, command=cmd, params=params,
-                channel="telegram", correlation_id=str(update_id),
+                identity=identity, command=command, params=params,
+                channel="telegram", correlation_id=correlation_id,
             )
         except Exception:
-            self.send(REFRESH_FAIL if cmd == "refresh" else GENERIC_OP_FAIL)
+            self.send(REFRESH_FAIL if command == "refresh" else GENERIC_OP_FAIL)
             return
-        # A delivery failure is not a failed collection. Preserve the snapshot
-        # and let the polling loop log the failed delivery without exposing data.
-        self.send(result["text"])
+        try:
+            # Serialize report delivery, not collection. Re-read under the delivery
+            # lock so overlapping commands cannot repeat acknowledged changes.
+            with FileLock(os.path.join(self.service.home, "service-telegram-delivery.lock")):
+                if command in ("refresh", "report"):
+                    result = self.service.execute(identity, "report", [], "telegram", correlation_id)
+                self.send(result["text"])
+                self.service.acknowledge_delivery(result)
+        except Exception:
+            sys.stderr.write("Telegram 命令处理或投递失败；可重新请求快照。\n")
 
     def stop(self) -> None:
         """Signals the long polling loop to stop."""
@@ -281,35 +296,30 @@ class TelegramBot:
         if isinstance(webhook_info, dict) and webhook_info.get("url"):
             raise ValueError("Webhook is active; long polling rejected")
 
-        # 3. getUpdates polling loop
-        offset: int | None = None
-        while not self._stopped:
-            payload: dict[str, Any] = {
-                "timeout": 30,
-                "allowed_updates": ["message"],
-            }
-            if offset is not None:
-                payload["offset"] = offset
-
-            try:
-                updates = self.request("getUpdates", payload)
-            except ValueError:
-                # Finite safe retry delay on transient polling failures
-                time.sleep(self.retry_delay)
-                continue
-            except KeyboardInterrupt:
-                break
-
-            if isinstance(updates, list):
-                for update in updates:
-                    if isinstance(update, dict):
-                        try:
-                            self.handle_update(update)
-                        except Exception:
-                            sys.stderr.write("Telegram 命令处理或投递失败；可重新请求快照。\n")
-                        uid = update.get("update_id")
-                        if uid is not None:
-                            offset = uid + 1
+        # Keep polling while refresh commands join a shared account collection.
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            offset: int | None = None
+            while not self._stopped:
+                payload: dict[str, Any] = {"timeout": 30, "allowed_updates": ["message"]}
+                if offset is not None:
+                    payload["offset"] = offset
+                try:
+                    updates = self.request("getUpdates", payload)
+                except ValueError:
+                    time.sleep(self.retry_delay)
+                    continue
+                except KeyboardInterrupt:
+                    break
+                if isinstance(updates, list):
+                    for update in updates:
+                        if isinstance(update, dict):
+                            try:
+                                self.handle_update(update, executor)
+                            except Exception:
+                                sys.stderr.write("Telegram 命令处理或投递失败；可重新请求快照。\n")
+                            uid = update.get("update_id")
+                            if uid is not None:
+                                offset = uid + 1
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -92,10 +92,14 @@ class SecureRefresh(unittest.TestCase):
         restarted = AccountService(self.home.archive, self.secrets_path)
         self.assertEqual(first, self.command("report", restarted))
         self.assertEqual([], self.server.requests())
-        self.server.force_status(r"/courses/1101/assignments", 403)
+        self.server.force_status(r"/courses/\d+/assignments", 403)
         failed = self.command("refresh")
         self.assertIn("失败", failed["text"])
-        self.assertEqual(first, self.command("report", restarted))
+        report = self.command("report", restarted)
+        self.assertFalse(report["complete"])
+        self.assertEqual(first["collected_at"], report["collected_at"])
+        self.assertIn("ACCT1101", report["text"])
+        self.assertIn("失败", report["text"])
 
     def test_binding_changes_and_unauthorized_identity_cannot_read(self):
         with self.assertRaises(ValueError):
@@ -137,11 +141,199 @@ class SecureRefresh(unittest.TestCase):
         self.assertIn("Probability homework", first["text"])
         self.assertIn("新课程：STAT2011", first["text"])
         self.assertNotIn("新增：", first["text"])
+        self.service.acknowledge_delivery(first)
         self.sc.course[1104]["assignments"][0]["due_at"] = "2026-03-28T10:00:00Z"
         second = self.command("refresh")
         self.assertIn("改期：STAT2011", second["text"])
         self.assertNotIn("新课程：STAT2011", second["text"])
         self.assertEqual(2, sum(r["path"] == "/api/v1/courses/1104/assignments" for r in self.server.requests()))
+
+    def test_learner_due_date_and_undated_tasks_use_assignment_evidence(self):
+        task = self.sc.course[1101]["assignments"][0]
+        task.update(name="Personal extension", has_overrides=True, due_at="2026-03-27T10:00:00Z",
+                    submission={"workflow_state": "unsubmitted", "cached_due_date": "2026-03-20T10:00:00Z"})
+        text = self.command("refresh")["text"]
+        self.assertIn("Personal extension", text.split("逾期未交")[0])
+        task.update(name="Undated zero-point task", due_at=None, lock_at="2026-03-27T10:00:00Z", points_possible=0)
+        text = self.command("refresh")["text"]
+        self.assertIn("Undated zero-point task", text.split("日期不明任务")[1].split("新增与改期")[0])
+
+    def test_submission_evidence_not_grades_controls_reminders(self):
+        def assignment(aid, name, submission, **extra):
+            return dict(id=aid, name=name, due_at="2026-03-27T10:00:00Z", points_possible=10,
+                        html_url=f"{{{{BASE}}}}/courses/1101/assignments/{aid}",
+                        submission_types=["online_upload"], submission=submission, **extra)
+        values = [assignment(901, "Upload", {"workflow_state": "unsubmitted"}),
+                  assignment(902, "ScoreOnly", {"workflow_state": "graded", "score": 0}),
+                  assignment(903, "Excused", {"workflow_state": "unsubmitted", "excused": True}),
+                  assignment(904, "Paper", {"workflow_state": "graded", "score": 50}),
+                  assignment(905, "Group", {"workflow_state": "submitted"}, group_category_id=12),
+                  assignment(906, "Quiz", {"workflow_state": "pending_review"}, is_quiz_assignment=True)]
+        values[3]["submission_types"] = ["on_paper"]
+        self.sc.course[1101]["assignments"] = values
+        first = self.command("refresh")
+        pending = first["text"].split("新增与改期")[0]
+        self.assertIn("Upload", pending)
+        self.assertIn("ScoreOnly", pending)
+        self.assertIn("Paper", pending)
+        self.assertIn("提交状态需确认", pending)
+        for name in ("Excused", "Group", "Quiz"):
+            self.assertNotIn(name, pending)
+        values[0]["submission"] = {"workflow_state": "submitted", "submitted_at": "2026-03-24T22:00:00Z", "attempt": 1}
+        values[0]["due_at"] = "2026-03-30T10:00:00Z"
+        submitted = self.command("refresh")["text"]
+        self.assertNotIn("Upload", submitted.split("新增与改期")[0])
+        values[0]["submission"].update(workflow_state="graded", score=0, grade="F")
+        values[0]["due_at"] = "2026-03-31T10:00:00Z"
+        graded = self.command("refresh")["text"]
+        self.assertNotIn("Upload", graded.split("新增与改期")[0])
+        values[0]["submission"]["redo_request"] = True
+        redone = self.command("refresh")["text"]
+        self.assertIn("Upload", redone.split("新增与改期")[0])
+        self.assertIn("要求重新提交", redone)
+
+    def test_partial_refresh_updates_other_courses_and_marks_stale_data(self):
+        self.sc.course[1101]["assignments"][0].update(name="Preserved old task", due_at="2026-03-27T10:00:00Z",
+                                                    submission={"workflow_state": "unsubmitted"})
+        first = self.command("refresh")
+        pin_now("2026-03-25T01:00:00Z")
+        self.server.force_status(r"/courses/1101/assignments", 403)
+        self.sc.course[1102]["assignments"][0].update(name="Fresh task", due_at="2026-03-28T10:00:00Z",
+                                                    submission={"workflow_state": "unsubmitted"})
+        partial = self.command("refresh")
+        self.assertFalse(partial["complete"])
+        self.assertIn("Fresh task", partial["text"])
+        self.assertIn("Preserved old task", partial["text"])
+        self.assertIn("ACCT1101", partial["text"])
+        self.assertIn(first["collected_at"], partial["text"])
+        self.assertIn("2026-03-25T01:00:00", partial["text"])
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        self.assertEqual(partial, self.command("report", restarted))
+        self.server.force_status(r"/courses/\d+/assignments", 403)
+        pin_now("2026-03-25T02:00:00Z")
+        failed = self.command("refresh", restarted)
+        self.assertFalse(failed["complete"])
+        self.assertEqual(partial["collected_at"], failed["collected_at"])
+        self.assertIn("全部", failed["text"])
+        self.assertIn("Fresh task", failed["text"])
+        self.assertNotIn("没有待交", failed["text"])
+
+    def test_delivered_changes_do_not_repeat_or_consume_scheduled_changes(self):
+        task = self.sc.course[1101]["assignments"][0]
+        task.update(name="Changing task", due_at="2026-03-27T10:00:00Z", submission={"workflow_state": "unsubmitted"})
+        first = self.command("refresh")
+        self.service.acknowledge_delivery(first)
+        task["submission"].update(workflow_state="submitted", submitted_at="2026-03-24T22:00:00Z", attempt=1)
+        changed = self.command("refresh")
+        self.assertIn("Changing task", changed["text"].split("最近已提交")[1])
+        # Until the channel confirms delivery, restart and another scan must retain it.
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        retried = self.command("refresh", restarted)
+        self.assertIn("Changing task", retried["text"].split("最近已提交")[1])
+        restarted.acknowledge_delivery(retried)
+        task["submission"].update(workflow_state="graded", score=0)
+        again = self.command("refresh", restarted)
+        self.assertNotIn("Changing task", again["text"].split("最近已提交")[1])
+        self.assertNotIn("Changing task", self.command("report", restarted)["text"].split("最近已提交")[1])
+        # The persisted notification obligation is independent of manual viewing.
+        journal = jload(Path(self.home.archive, "service-report.json"))["events"]
+        submissions = [event for event in journal if event["kind"] == "submitted" and "Changing task" in event["text"]]
+        self.assertEqual(1, len(submissions))
+        self.assertEqual(["scheduled"], submissions[0]["pending"])
+
+    def test_new_course_notice_survives_total_assignment_failure(self):
+        first = self.command("refresh")
+        self.service.acknowledge_delivery(first)
+        self.sc.courses.append({"id": 1104, "name": "STAT2011 Probability", "course_code": "STAT2011", "_active": True})
+        self.sc.course[1104] = {"assignments": []}
+        self.server.force_status(r"/courses/\d+/assignments", 403)
+        failed = self.command("refresh")
+        self.assertFalse(failed["complete"])
+        self.assertIn("新课程：STAT2011", failed["text"])
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        self.assertIn("新课程：STAT2011", self.command("report", restarted)["text"])
+        restarted.acknowledge_delivery(failed)
+        again = self.command("refresh", restarted)
+        self.assertNotIn("新课程：STAT2011", again["text"])
+        self.assertIn("STAT2011", again["text"])
+
+    def test_overlapping_refreshes_share_collection_and_next_request_is_immediate(self):
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        original = mockcanvas._Handler.r_user_self
+        def hold_request(handler):
+            entered.set()
+            if not release.wait(5):
+                return handler._send(500, {})
+            return original(handler)
+        other = AccountService(self.home.archive, self.secrets_path)
+        with patch.object(mockcanvas._Handler, "r_user_self", hold_request), ThreadPoolExecutor(2) as pool:
+            first = pool.submit(self.command, "refresh")
+            try:
+                self.assertTrue(entered.wait(5))
+                second = pool.submit(self.command, "refresh", other)
+                with self.assertRaises(TimeoutError):
+                    second.result(timeout=0.15)
+            finally:
+                release.set()
+            one, two = first.result(timeout=5), second.result(timeout=5)
+        self.assertTrue(one["complete"], one)
+        self.assertEqual(one, two)
+        self.assertEqual(1, sum(r["path"] == "/api/v1/users/self" for r in self.server.requests()))
+        next_result = self.command("refresh", other)
+        self.assertTrue(next_result["complete"])
+        self.assertEqual(2, sum(r["path"] == "/api/v1/users/self" for r in self.server.requests()))
+
+    def test_delivery_acknowledgement_during_collection_is_not_overwritten(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        task = self.sc.course[1101]["assignments"][0]
+        task.update(name="Delivered during refresh", submission={"workflow_state": "submitted", "submitted_at": "2026-03-24T22:00:00Z"})
+        pending = self.command("refresh")
+        entered, release = threading.Event(), threading.Event()
+        original = mockcanvas._Handler.r_user_self
+        def hold_request(handler):
+            entered.set()
+            release.wait(5)
+            return original(handler)
+        with patch.object(mockcanvas._Handler, "r_user_self", hold_request), ThreadPoolExecutor(1) as pool:
+            refreshed = pool.submit(self.command, "refresh")
+            try:
+                self.assertTrue(entered.wait(5))
+                self.service.acknowledge_delivery(pending)
+            finally:
+                release.set()
+            result = refreshed.result(timeout=5)
+        self.assertNotIn("Delivered during refresh", result["text"].split("最近已提交")[1])
+
+    def test_failed_telegram_delivery_keeps_change_until_report_succeeds(self):
+        import io
+        import urllib.request
+        from cc_telegram import TelegramBot
+        task = self.sc.course[1101]["assignments"][0]
+        task.update(name="Retry submission notice", submission={"workflow_state": "submitted", "submitted_at": "2026-03-24T22:00:00Z"})
+        self.command("refresh")
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        update = {"update_id": 90, "message": {"from": {"id": 1234}, "chat": {"id": 1234, "type": "private"}, "text": "/report"}}
+        sent, fail = [], [True]
+        def boundary(opener, request, *args, **kwargs):
+            self.assertTrue(request.full_url.startswith("https://api.telegram.org/"))
+            payload = json.loads(request.data)
+            sent.append(payload["text"])
+            if fail[0]:
+                raise OSError("simulated delivery failure")
+            return io.BytesIO(json.dumps({"ok": True, "result": {"message_id": 1}}).encode())
+        with patch.object(urllib.request.OpenerDirector, "open", boundary):
+            bot.handle_update(update)
+            sent.clear()
+            fail[0] = False
+            bot.service = AccountService(self.home.archive, self.secrets_path)
+            bot.handle_update(update)
+            self.assertIn("Retry submission notice", "".join(sent))
+            sent.clear()
+            bot.handle_update(update)
+            self.assertNotIn("Retry submission notice", "".join(sent))
 
     def test_redirect_and_pagination_never_contact_target(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -277,7 +469,10 @@ class SecureRefresh(unittest.TestCase):
                 with patch.object(mockcanvas._Handler, "r_courses", invalid_courses):
                     failed = self.command("refresh")
                 self.assertIn("失败", failed["text"])
-                self.assertEqual(first, self.command("report"))
+                report = self.command("report")
+                self.assertFalse(report["complete"])
+                self.assertEqual(first["collected_at"], report["collected_at"])
+                self.assertIn("ACCT1101", report["text"])
                 self.assertEqual(config_before, Path(self.home.archive, "config.json").read_bytes())
 
 
