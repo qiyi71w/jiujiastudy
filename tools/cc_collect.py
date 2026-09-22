@@ -133,7 +133,7 @@ def collect(ctx, date, quick=False, touch=False, download=None):
         lock.release()
 
 
-def refresh_courses(ctx, api, errors):
+def refresh_courses(ctx, api, errors, allow_empty=False):
     """每次完整采集对一次在读课程：新课加进来，看不到的课标 inactive（S02）。
 
     课程清单原来只在第一次建档时拉一次，于是下学期的课、后加的课永远不出现，
@@ -145,7 +145,7 @@ def refresh_courses(ctx, api, errors):
     except Exception as e:  # noqa: BLE001  课程清单拉不到不该挡住采集
         errors.append(f"课程清单没刷新（{type(e).__name__}）")
         return []
-    if not isinstance(live, list) or not live:
+    if not isinstance(live, list) or not live and not allow_empty:
         return []
     raw = ctx.raw_cfg
     if "courses" not in raw:
@@ -158,7 +158,7 @@ def refresh_courses(ctx, api, errors):
             continue
         seen.add(cid)
         if cid in known:
-            if known[cid].pop("inactive", None):
+            if not known[cid].get("access_lost") and known[cid].pop("inactive", None):
                 changes.append(f"{known[cid].get('code')} 又能看到了")
             continue
         name, code_raw = c.get("name"), c.get("course_code")

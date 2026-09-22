@@ -28,6 +28,7 @@ COMMANDS = {
     "status": "查看服务及快照状态；关闭时也可用，不访问 Canvas",
     "report": "查看当前快照日报及数据时间；关闭时也可用，不访问 Canvas",
     "refresh": "仅服务开启时立即重新采集并生成规则日报；关闭时拒绝",
+    "courses": "查看监控与已停止课程，通过按钮停止或重新加入；关闭时只保存选择",
     "tasks": "查看任务、已停止项和确认按钮；/canvas tasks stopped 查看已停止项；关闭时也可用，不访问 Canvas",
     "schedule": "设置每日基准时间及 IANA 时区：/canvas schedule HH:MM Area/City；关闭时也可用",
     "on": "开启服务，立即采集并恢复当日计划；已开启时不重复采集",
@@ -356,8 +357,72 @@ class AccountService:
     @staticmethod
     def _task_valid(ctx, saved, aid):
         fact = saved.get("snapshot", {}).get("assignments", {}).get(aid)
-        return (fact if fact and fact.get("course") in
-                {code for _, code in course_pairs(ctx.cfg, include_inactive=False)} else None)
+        return (fact if fact and (str(fact.get("course_id")) in {str(cid) for cid, _ in AccountService._monitored(ctx, saved)}
+                if fact.get("course_id") else fact.get("course") in
+                {code for _, code in AccountService._monitored(ctx, saved)}) else None)
+    @staticmethod
+    def _monitored(ctx, saved):
+        stopped = set((saved or {}).get("stopped_courses", []))
+        return [(cid, code) for cid, code in course_pairs(ctx.cfg, include_inactive=False)
+                if str(cid) not in stopped]
+
+    def course_list(self, identity):
+        ctx = self._authorized(identity)
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved() or {"binding": self.binding}
+            stopped = set(saved.get("stopped_courses", []))
+            lines = ["监控课程与已停止监控课程"]
+            actions = []
+            for course in ctx.cfg.get("courses") or []:
+                cid = str(course["id"])
+                inactive = bool(course.get("inactive"))
+                paused = cid in stopped
+                state = "已停止监控" if paused else "已结束或失去访问，旧任务暂停提醒" if inactive else "监控中"
+                lines.append(f"{course['code']} · {course.get('name') or course['code']} — {state}")
+                token = uuid.uuid4().hex
+                saved.setdefault("course_buttons", {})[token] = {
+                    "cid": cid, "stopped": paused, "inactive": inactive,
+                    "at": dt.datetime.now(dt.timezone.utc).timestamp()}
+                actions.append([{"text": ("重新加入" if paused else "停止监控") + " " + course["code"],
+                                 "data": "course:" + token}])
+            if not actions:
+                lines.append("尚无课程；开启后使用 /canvas refresh 发现新课。")
+            saved["course_buttons"] = dict(list(saved.get("course_buttons", {}).items())[-300:])
+            jsave(self.report_path, saved)
+        return {**self._result("\n".join(lines), saved), "actions": actions}
+
+    def course_action(self, identity, data):
+        ctx = self._authorized(identity)
+        if not isinstance(data, str) or not data.startswith("course:") or len(data) != 39:
+            return self._result("按钮无效，请重新打开课程列表。")
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved() or {"binding": self.binding}
+            button = saved.get("course_buttons", {}).pop(data[7:], None)
+            courses = {str(c["id"]): c for c in ctx.cfg.get("courses") or []}
+            course = courses.get(button["cid"]) if button else None
+            stopped = set(saved.get("stopped_courses", []))
+            if (not button or not course or dt.datetime.now(dt.timezone.utc).timestamp() - button["at"] > 900
+                    or (button["cid"] in stopped) != button["stopped"]
+                    or bool(course.get("inactive")) != button["inactive"]):
+                jsave(self.report_path, saved)
+                return self._result("按钮已过期，请重新打开课程列表。")
+            cid = button["cid"]
+            if cid in stopped:
+                stopped.remove(cid)
+            else:
+                stopped.add(cid)
+            saved["stopped_courses"] = sorted(stopped)
+            jsave(self.report_path, saved)
+            generation = saved.get("service_generation", 0)
+            enabled = saved.get("service_enabled", True)
+        if not button["stopped"]:
+            return self._result("已停止监控 " + course["code"] + "；旧任务保留但不再催交。")
+        if not enabled:
+            return self._result("已重新加入 " + course["code"] + "；开启服务后采集。")
+        collected = self._collect(generation=generation, required_course=cid)
+        if not self.permitted(generation):
+            return {**self._result("本次采集已失效。"), "stale": True}
+        return {**self._result("已重新加入 " + course["code"] + "；" + self._report(_CollectionContext(self.home, quiet=True), collected, []), collected), "generation": generation}
 
     @staticmethod
     def _button(saved, aid, phase, label, version):
@@ -475,6 +540,8 @@ class AccountService:
             return self._report_result(ctx, saved)
         if command == "schedule":
             return self.set_schedule(ctx, params)
+        if command == "courses":
+            return self.course_list(identity)
         if command == "tasks":
             return self.task_list(identity, stopped=bool(params))
         if command == "off":
@@ -489,7 +556,7 @@ class AccountService:
             return {**self._result("本次采集已失效；服务状态已变化。"), "stale": True}
         return self._report_result(_CollectionContext(self.home, quiet=True), collected)
 
-    def _collect(self, plan_day=None, generation=None):
+    def _collect(self, plan_day=None, generation=None, required_course=None):
         """Purpose-neutral collection; only validated commands may join it.
 
         The persisted attempt id distinguishes joining an in-flight request from
@@ -514,9 +581,10 @@ class AccountService:
             if plan_day and saved and saved.get("daily_plans", {}).get(plan_day, {}).get("state") != "collecting":
                 return saved
             if joined and saved and saved.get("last_attempt", {}).get("id") != attempt_id:
-                return saved
+                if required_course is None or str(required_course) in saved["last_attempt"].get("collected_courses", []):
+                    return saved
             try:
-                return self._refresh(ctx, secrets, saved, generation)
+                return self._refresh(ctx, secrets, saved, generation, scheduled=plan_day is not None)
             except _StaleOperation:
                 return self._saved()
             except Exception:
@@ -528,7 +596,7 @@ class AccountService:
     def _failed(self, ctx, previous, failures, generation):
         return self._commit(ctx, previous, None, [], failures, generation)
 
-    def _commit(self, ctx, previous, snap, course_changes, failures, generation):
+    def _commit(self, ctx, previous, snap, course_changes, failures, generation, collected_courses=(), scheduled=False):
         # Collection and delivery have separate locks: a late send acknowledgement
         # must not be overwritten by a refresh that was already doing network IO.
         with FileLock(ctx.P("service-state.lock")):
@@ -545,14 +613,17 @@ class AccountService:
             saved.setdefault("events", [])
             saved.setdefault("next_event", 1)
             old = saved.get("snapshot", {})
-            self._record_changes(ctx, saved, snap, course_changes)
+            self._record_changes(ctx, saved, snap, course_changes, scheduled)
             if snap is not None:
                 if old.get("complete"):
                     saved["previous_success"] = old
                 saved.update(snapshot=snap, collected_at=snap["collected_at"])
             saved["last_attempt"] = {"id": uuid.uuid4().hex, "at": ctx.clock.now_utc().isoformat(),
                                      "complete": snap is not None and not failures,
-                                     "promoted": snap is not None, "failures": failures}
+                                     "promoted": snap is not None, "failures": failures,
+                                     "collected_courses": [str(c["id"]) for c in ctx.cfg.get("courses") or []
+                                                           if str(c["id"]) in collected_courses
+                                                           and str(c["id"]) not in saved.get("stopped_courses", [])]}
             for plan in saved.get("daily_plans", {}).values():
                 if plan["state"] == "collecting":
                     events = [e for e in saved["events"] if "scheduled" in e["pending"]]
@@ -565,38 +636,50 @@ class AccountService:
         return saved
 
     @staticmethod
-    def _record_changes(ctx, saved, snap, course_changes):
+    def _record_changes(ctx, saved, snap, course_changes, scheduled=False):
         old = saved.get("snapshot", {})
         old_facts = old.get("assignments", {})
         now = ctx.clock.now_utc()
 
-        def append(kind, text):
+        def append(kind, text, course=None, course_id=None):
             saved["events"].append({"id": saved["next_event"], "kind": kind, "text": text,
+                                    "course": course, "course_id": course_id,
                                     "at": now.isoformat(), "pending": ["manual", "scheduled"]})
             saved["next_event"] += 1
 
         for change in course_changes:
-            append("course", f"{change}\n{ctx.cfg['canvas_host'].rstrip('/')}/courses")
+            code = change.split("：", 1)[1].split(" ", 1)[0] if change.startswith("新课程：") else change.split(" ", 1)[0]
+            append("course", f"{change}{'；请确认课程状态' if '在 Canvas 上看不到了' in change else ''}\n{ctx.cfg['canvas_host'].rstrip('/')}/courses", code)
+            if change.startswith("新课程："):
+                saved["events"][-1]["pending"] = ["scheduled" if scheduled else "manual"]
+        active = {code for _, code in AccountService._monitored(ctx, saved)}
+        active_ids = {str(cid) for cid, _ in AccountService._monitored(ctx, saved)}
         if snap is None:
             return
         for aid, fact in snap["assignments"].items():
-            if snap["course_freshness"].get(fact["course"]) != snap["collected_at"]:
+            if (fact.get("course_id") and fact["course_id"] not in active_ids or
+                    not fact.get("course_id") and fact["course"] not in active or
+                    snap.get("course_freshness_by_id", {}).get(fact.get("course_id"),
+                        snap["course_freshness"].get(fact["course"])) != snap["collected_at"]):
                 continue
             before = old_facts.get(aid)
             label = f"{fact['course']} · {fact['name']}\n{fact.get('html_url') or '来源链接未提供'}"
-            baseline = fact["course"] not in old.get("course_freshness", {})
+            def append_fact(kind, text):
+                append(kind, text, fact["course"], fact.get("course_id"))
+            baseline = (fact["course_id"] not in old.get("course_freshness_by_id", {}) if fact.get("course_id") and old.get("course_freshness_by_id")
+                        else fact["course"] not in old.get("course_freshness", {}))
             if before is None and not baseline:
-                append("added", "新增：" + label)
+                append_fact("added", "新增：" + label)
             elif before is not None and fact.get("due_at") != before.get("due_at"):
-                append("due", f"改期：{label}\n{before.get('due_at') or '日期不明'} → {fact.get('due_at') or '日期不明'}")
+                append_fact("due", f"改期：{label}\n{before.get('due_at') or '日期不明'} → {fact.get('due_at') or '日期不明'}")
                 if aid in saved.get("reminders", {}):
                     saved["reminders"].pop(aid)
-                    append("reminder", ("改期后停止状态解除（已提交，无需催交）：" if fact.get("sub_state") in ("submitted", "excused") or fact.get("excused") else "改期后恢复提醒：") + label)
+                    append_fact("reminder", ("改期后停止状态解除（已提交，无需催交）：" if fact.get("sub_state") in ("submitted", "excused") or fact.get("excused") else "改期后恢复提醒：") + label)
             if fact.get("sub_state") == "resubmit" and before and before.get("sub_state") != "resubmit":
-                append("redo", "Canvas 要求重新提交：" + label)
+                append_fact("redo", "Canvas 要求重新提交：" + label)
                 if aid in saved.get("reminders", {}):
                     saved["reminders"].pop(aid)
-                    append("reminder", "明确要求重新提交后恢复提醒：" + label)
+                    append_fact("reminder", "明确要求重新提交后恢复提醒：" + label)
             if fact.get("sub_state") != "submitted":
                 continue
             submitted = parse_ts(fact.get("submitted_at"))
@@ -606,9 +689,9 @@ class AccountService:
                 changed = before is None or any(fact.get(key) != before.get(key)
                                                for key in ("sub_state", "submitted_at", "attempt"))
             if changed:
-                append("submitted", label)
+                append_fact("submitted", label)
 
-    def _refresh(self, ctx, secrets, previous, generation):
+    def _refresh(self, ctx, secrets, previous, generation, scheduled=False):
         api = SecureCanvas(secrets.canvas_origin, secrets.canvas_token, permit=lambda: self._require(generation))
         who = api.get("/api/v1/users/self")
         if not isinstance(who, dict) or not who.get("id"):
@@ -618,50 +701,81 @@ class AccountService:
         previous = dict(previous or {"binding": self.binding})
         previous["canvas_user_id"] = who["id"]
         errors = []
-        changes = refresh_courses(ctx, api, errors)
+        changes = refresh_courses(ctx, api, errors, allow_empty=True)
         self._require(generation)
         if errors:
             return self._failed(ctx, previous, [{"course": None, "kind": "course_list"}], generation)
-        courses = course_pairs(ctx.cfg, include_inactive=False)
+        courses = self._monitored(ctx, self._saved()) + [
+            (c["id"], c["code"]) for c in ctx.cfg.get("courses") or []
+            if c.get("access_lost") and str(c["id"]) not in (self._saved() or {}).get("stopped_courses", [])]
         assignments, failures = {}, []
         for cid, code in courses:
+            if str(cid) in (self._saved() or {}).get("stopped_courses", []):
+                continue
             try:
                 values = api.get(f"/api/v1/courses/{cid}/assignments?per_page=100&include[]=submission")
                 if not isinstance(values, list) or any(not isinstance(a, dict) or not a.get("id") for a in values):
                     raise ValueError("作业采集失败")
-                assignments[code] = values
+                assignments[str(cid)] = values
+                course = next(c for c in ctx.raw_cfg["courses"] if str(c["id"]) == str(cid))
+                if course.pop("access_lost", None):
+                    course.pop("inactive", None)
+                    changes.append(f"{code} 又能看到了")
             except _StaleOperation:
                 raise
+            except ValueError as exc:
+                if str(exc) in ("Canvas API request failed with HTTP 403", "Canvas API request failed with HTTP 404"):
+                    try:
+                        api.get(f"/api/v1/courses/{cid}")
+                    except ValueError as confirmation:
+                        if str(confirmation) in ("Canvas API request failed with HTTP 403", "Canvas API request failed with HTTP 404"):
+                            course = next(c for c in ctx.raw_cfg["courses"] if str(c["id"]) == str(cid))
+                            if not course.get("inactive"):
+                                course["inactive"] = True
+                                changes.append(f"{code} 已失去访问，旧任务已暂停提醒；请确认课程状态")
+                            course["access_lost"] = True
+                            continue
+                    except _StaleOperation:
+                        raise
+                failures.append({"course": code, "kind": "assignments"})
             except Exception:
                 failures.append({"course": code, "kind": "assignments"})
-        if courses and not assignments:
+        ctx.cfg = effective(ctx.raw_cfg)
+        if failures and not assignments:
             self._require(generation)
-            result = self._commit(ctx, previous, None, changes, failures, generation)
+            result = self._commit(ctx, previous, None, changes, failures, generation, scheduled=scheduled)
             self._require(generation)
             jsave(ctx.P("config.json"), ctx.raw_cfg)
             return result
-        snap = snapshot_from(courses, assignments, {}, {}, {}, {})
-        for values in assignments.values():
-            for assignment in values:
+        snap = snapshot_from([], {}, {}, {}, {}, {})
+        for cid, code in courses:
+            bundle = snapshot_from([(cid, code)], {code: assignments.get(str(cid), [])}, {}, {}, {}, {})
+            for assignment in assignments.get(str(cid), []):
                 sub = assignment.get("submission") or {}
-                fact = snap["assignments"][str(assignment["id"])]
+                fact = bundle["assignments"][str(assignment["id"])]
+                fact["course_id"] = str(cid)
                 fact["sub_state"] = _submission_state(sub, fact["submission_types"])
                 fact["excused"] = sub.get("excused") is True
                 for key in ("score", "grade", "graded_at", "posted_at", "attachments", "desc_hash"):
                     fact.pop(key, None)
+                snap["assignments"][str(assignment["id"])] = fact
         now = ctx.clock.now_utc().isoformat()
         old = (previous or {}).get("snapshot", {})
         freshness = dict(old.get("course_freshness", {}))
+        by_id = dict(old.get("course_freshness_by_id", {}))
         for fact in old.get("assignments", {}).values():
             freshness.setdefault(fact["course"], old.get("collected_at"))
         for aid, fact in old.get("assignments", {}).items():
-            if fact["course"] not in assignments:
+            if (fact.get("course_id") or next((str(cid) for cid, code in courses if code == fact["course"]), None)) not in assignments:
                 snap["assignments"][aid] = fact
-        freshness.update({code: now for code in assignments})
+        for cid, code in courses:
+            if str(cid) in assignments:
+                freshness[code] = now
+                by_id[str(cid)] = now
         snap.update(collected_at=now, complete=not failures, course_freshness=freshness,
-                    baseline=not bool(old))
+                    course_freshness_by_id=by_id, baseline=not bool(old))
         self._require(generation)
-        result = self._commit(ctx, previous, snap, changes, failures, generation)
+        result = self._commit(ctx, previous, snap, changes, failures, generation, assignments, scheduled)
         self._require(generation)
         jsave(ctx.P("config.json"), ctx.raw_cfg)
         return result
@@ -674,18 +788,22 @@ class AccountService:
         complete = attempt.get("complete", snap.get("complete", False))
         now = ctx.clock.now_utc()
         end = ctx.clock.course_date(now) + dt.timedelta(days=7)
-        active_courses = {code for _, code in course_pairs(ctx.cfg, include_inactive=False)}
+        active_courses = {code for _, code in AccountService._monitored(ctx, saved)}
+        active_ids = {str(cid) for cid, _ in AccountService._monitored(ctx, saved)}
+        stopped_ids = set(saved.get("stopped_courses", []))
+        stopped_codes = {c["code"] for c in ctx.cfg.get("courses") or []
+                         if str(c["id"]) in stopped_ids}
         sections = {"未来七天待交": [], "逾期未交": [], "日期不明任务": [],
                     "新增与改期": [], "最近已提交（尚未通知）": [], "新课程与课程变化": [],
                     "暂停提醒的旧数据": []}
         for aid, fact in sorted(snap.get("assignments", {}).items(), key=lambda item: (item[1].get("due_at") or "", item[1]["course"], item[1].get("name") or "")):
             state = fact.get("sub_state")
-            if aid in saved.get("reminders", {}):
+            if aid in saved.get("reminders", {}) or (fact.get("course_id") in stopped_ids if fact.get("course_id") else fact["course"] in stopped_codes):
                 continue
             if state in ("submitted", "excused") or fact.get("excused"):
                 continue
             due = parse_ts(fact.get("due_at"))
-            if fact["course"] not in active_courses:
+            if (fact.get("course_id") not in active_ids if fact.get("course_id") else fact["course"] not in active_courses):
                 kind = "暂停提醒的旧数据"
             elif not due:
                 kind = "日期不明任务"
@@ -699,11 +817,14 @@ class AccountService:
             if state == "resubmit":
                 status = "；Canvas 要求重新提交"
             if any(f["course"] in (None, fact["course"]) for f in failures) or kind == "暂停提醒的旧数据":
-                stamp = snap.get("course_freshness", {}).get(fact["course"]) or snap.get("collected_at")
+                stamp = (snap.get("course_freshness_by_id", {}).get(fact.get("course_id")) or
+                         snap.get("course_freshness", {}).get(fact["course"]) or snap.get("collected_at"))
                 status += f"；旧数据，截至 {stamp}，需确认"
             when = ctx.clock.fmt(due) if due else "Canvas 没写日期"
             sections[kind].append(f"{fact['course']} · {fact['name']} — {when}{status}\n{fact.get('html_url') or '来源链接未提供'}")
         for event in events:
+            if event.get("kind") != "course" and (event.get("course_id") not in active_ids if event.get("course_id") else event.get("course") and event["course"] not in active_courses):
+                continue
             section = ("最近已提交（尚未通知）" if event["kind"] == "submitted" else
                        "新课程与课程变化" if event["kind"] == "course" else "新增与改期")
             sections[section].append(event["text"] + f"\n发现于：{event['at']}")

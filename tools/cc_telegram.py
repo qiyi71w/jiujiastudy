@@ -226,11 +226,12 @@ class TelegramBot:
                 authorized = False
             if authorized and isinstance(callback.get("id"), str):
                 try:
-                    result = (self.service.execute(int(self.service.user_id), "schedule", [], "telegram", str(update.get("update_id", "")))
-                              if callback.get("data") == "schedule:help" else
-                              self.service.task_action(int(self.service.user_id), callback.get("data")))
+                    data = callback.get("data")
                     self.request("answerCallbackQuery", {"callback_query_id": callback["id"]})
-                    self.send(result["text"], result.get("actions"))
+                    if isinstance(data, str) and data.startswith("course:") and executor is not None:
+                        executor.submit(self._execute_callback, data)
+                    else:
+                        self._execute_callback(data)
                 except Exception:
                     sys.stderr.write("Telegram 按钮处理失败。\n")
             return
@@ -276,6 +277,19 @@ class TelegramBot:
         generation = self.service.generation()
         if cmd == "refresh" and self.service.permitted(generation):
             self.send(REFRESH_ACK)
+    def _execute_callback(self, data):
+        try:
+            result = (self.service.execute(int(self.service.user_id), "schedule", [], "telegram", "callback")
+                      if data == "schedule:help" else
+                      self.service.course_action(int(self.service.user_id), data)
+                      if isinstance(data, str) and data.startswith("course:") else
+                      self.service.task_action(int(self.service.user_id), data))
+            if not result.get("stale"):
+                self.send(result["text"], result.get("actions"),
+                          permit=(lambda: self.service.permitted(result["generation"])) if "generation" in result else None)
+        except Exception:
+            sys.stderr.write("Telegram 按钮处理失败。\n")
+
         if cmd in ("refresh", "on") and executor is not None:
             executor.submit(self._execute_command, configured_uid, cmd, params, str(update_id), generation)
         else:

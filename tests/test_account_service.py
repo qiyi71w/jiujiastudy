@@ -148,6 +148,122 @@ class SecureRefresh(unittest.TestCase):
         self.assertNotIn("新课程：STAT2011", second["text"])
         self.assertEqual(2, sum(r["path"] == "/api/v1/courses/1104/assignments" for r in self.server.requests()))
 
+    def test_course_stop_persists_and_rejoin_collects_only_when_enabled(self):
+        self.sc.course[1101]["assignments"][0].update(
+            name="Stopped course task", due_at="2026-03-27T10:00:00Z",
+            submission={"workflow_state": "unsubmitted"})
+        self.command("refresh")
+        buttons = self.command("courses")["actions"]
+        stop = buttons[0][0]["data"]
+        self.assertIn("已停止监控", self.service.course_action(1234, stop)["text"])
+        self.assertIn("过期", self.service.course_action(1234, stop)["text"])
+        self.server.requests(clear=True)
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        self.command("refresh", restarted)
+        self.assertNotIn("Stopped course task", self.command("report", restarted)["text"])
+        self.assertFalse(any(r["path"] == "/api/v1/courses/1101/assignments" for r in self.server.requests()))
+        self.command("off", restarted)
+        join = restarted.execute(1234, "courses", [], "telegram", "list")["actions"][0][0]["data"]
+        self.server.requests(clear=True)
+        restarted.course_action(1234, join)
+        self.assertEqual([], self.server.requests())
+        self.assertIn("监控中", restarted.execute(1234, "courses", [], "telegram", "list")["text"])
+        self.command("on", restarted)
+        self.assertIn("Stopped course task", self.command("report", restarted)["text"])
+
+    def test_course_exit_is_distinct_from_transient_assignment_failure(self):
+        self.sc.course[1101]["assignments"][0].update(
+            name="Retained task", due_at="2026-03-27T10:00:00Z",
+            submission={"workflow_state": "unsubmitted"})
+        self.command("refresh")
+        self.server.force_status(r"/courses/1101/assignments", 500)
+        failed = self.command("refresh")
+        self.assertIn("Retained task", failed["text"])
+        self.server._force.clear()
+        self.assertIn("采集失败：ACCT1101", failed["text"])
+        self.assertIn("监控中", self.command("courses")["text"])
+        self.server.force_status(r"/courses/1101(?:/assignments)?$", 403)
+        exited = self.command("refresh")
+        self.assertIn("暂停提醒的旧数据", exited["text"])
+        self.assertNotIn("Retained task", exited["text"].split("未来七天待交")[1].split("逾期未交")[0])
+        self.assertIn("失去访问", self.command("courses")["text"])
+        self.service.acknowledge_delivery(exited)
+        again = self.command("refresh")
+        self.assertNotIn("已失去访问，旧任务", again["text"])
+    def test_inactive_stopped_course_rejoin_refreshes_access(self):
+        self.command("refresh")
+        self.sc.courses[0]["_active"] = False
+        self.command("refresh")
+        self.assertIn("失去访问", self.command("courses")["text"])
+        stop = self.command("courses")["actions"][0][0]["data"]
+        self.service.course_action(1234, stop)
+        self.sc.courses[0]["_active"] = True
+        self.sc.course[1101]["assignments"][0].update(name="Access restored task",
+            due_at="2026-03-27T10:00:00Z", submission={"workflow_state": "unsubmitted"})
+        self.server.requests(clear=True)
+        join = self.command("courses")["actions"][0][0]["data"]
+        result = self.service.course_action(1234, join)
+        self.assertIn("Access restored task", result["text"])
+        self.assertTrue(any(r["path"] == "/api/v1/courses/1101/assignments" for r in self.server.requests()))
+
+    def test_disappearing_course_prompts_once_and_suspends_due_tasks(self):
+        self.sc.course[1101]["assignments"][0].update(name="Vanished task",
+            due_at="2026-03-27T10:00:00Z", submission={"workflow_state": "unsubmitted"})
+        self.command("refresh")
+        self.sc.courses[0]["_active"] = False
+        exited = self.command("refresh")
+        self.assertIn("请确认课程状态", exited["text"])
+        self.assertNotIn("Vanished task", exited["text"].split("未来七天待交")[1].split("逾期未交")[0])
+        self.service.acknowledge_delivery(exited)
+        self.assertNotIn("请确认课程状态", self.command("refresh")["text"])
+
+    def test_stopping_one_of_two_same_code_courses_keeps_other_tasks(self):
+        self.sc.courses.append({"id": 1104, "name": "ACCT1101 Another section", "course_code": "ACCT1101", "_active": True})
+        self.sc.course[1104] = {"assignments": [{"id": 991, "name": "Other section task",
+            "due_at": "2026-03-27T10:00:00Z", "points_possible": 10,
+            "submission_types": ["online_upload"], "html_url": "{{BASE}}/courses/1104/assignments/991",
+            "submission": {"workflow_state": "unsubmitted"}}]}
+        self.command("refresh")
+        stop = self.command("courses")["actions"][0][0]["data"]
+        self.service.course_action(1234, stop)
+        self.server.requests(clear=True)
+        report = self.command("refresh")["text"]
+        self.assertIn("Other section task", report.split("未来七天待交")[1].split("逾期未交")[0])
+        self.assertFalse(any(r["path"] == "/api/v1/courses/1101/assignments" for r in self.server.requests()))
+        self.assertTrue(any(r["path"] == "/api/v1/courses/1104/assignments" for r in self.server.requests()))
+
+    def test_rejoining_during_collection_backfills_missing_course(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        self.sc.course[1101]["assignments"][0].update(
+            name="Joined during scan", due_at="2026-03-27T10:00:00Z",
+            submission={"workflow_state": "unsubmitted"})
+        self.command("refresh")
+        stop = self.command("courses")["actions"][0][0]["data"]
+        self.service.course_action(1234, stop)
+        join = self.command("courses")["actions"][0][0]["data"]
+        entered, release = threading.Event(), threading.Event()
+        original = mockcanvas._Handler.r_assignments
+        def hold_other_course(handler, cid):
+            if cid == 1102:
+                entered.set()
+                if not release.wait(10):
+                    return handler._send(500, {})
+            return original(handler, cid)
+        self.server.requests(clear=True)
+        with patch.object(mockcanvas._Handler, "r_assignments", hold_other_course), ThreadPoolExecutor(2) as pool:
+            scan = pool.submit(self.command, "refresh")
+            try:
+                self.assertTrue(entered.wait(5))
+                rejoin = pool.submit(self.service.course_action, 1234, join)
+            finally:
+                release.set()
+            scan.result(timeout=10)
+            rejoin.result(timeout=10)
+        self.assertIn("Joined during scan", self.command("report")["text"])
+        self.assertEqual(1, sum(r["path"] == "/api/v1/courses/1101/assignments" for r in self.server.requests()))
+
+
     def test_learner_due_date_and_undated_tasks_use_assignment_evidence(self):
         task = self.sc.course[1101]["assignments"][0]
         task.update(name="Personal extension", has_overrides=True, due_at="2026-03-27T10:00:00Z",
@@ -411,6 +527,49 @@ class SecureRefresh(unittest.TestCase):
         self.service.acknowledge_delivery(changed)
         self.assertNotIn("Submission priority", self.command("report")["text"])
         self.assertNotIn("Submission priority", self.service.execute(1234, "tasks", ["stopped"], "telegram", "test")["text"])
+    def test_telegram_course_buttons_reject_foreign_group_and_replay(self):
+        from cc_telegram import TelegramBot
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        calls = []
+        bot.request = lambda method, payload=None: calls.append((method, payload))
+        bot.handle_update({"message": {"from": {"id": 1234}, "chat": {"id": 1234, "type": "private"},
+                                       "text": "/canvas courses"}})
+        token = calls[-1][1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        self.assertIn("courses", self.command("help")["text"])
+        callback = lambda uid, chat, kind, data: {"callback_query": {"id": "course-button", "from": {"id": uid},
+            "message": {"chat": {"id": chat, "type": kind}}, "data": data}}
+        calls.clear()
+        bot.handle_update(callback(4321, 1234, "private", token))
+        bot.handle_update(callback(1234, -1234, "group", token))
+        self.assertEqual([], calls)
+        bot.handle_update(callback(1234, 1234, "private", "course:" + "f" * 32))
+        self.assertIn("过期", calls[-1][1]["text"])
+        bot.handle_update(callback(1234, 1234, "private", token))
+        self.assertIn("已停止监控", calls[-1][1]["text"])
+        bot.handle_update(callback(1234, 1234, "private", token))
+        self.assertIn("过期", calls[-1][1]["text"])
+    def test_course_rejoin_stops_sending_after_off_during_first_segment(self):
+        from cc_telegram import TelegramBot
+        from cc_account import _CollectionContext
+        self.command("refresh")
+        self.service.course_action(1234, self.command("courses")["actions"][0][0]["data"])
+        sample = dict(self.sc.course[1101]["assignments"][0])
+        sample.update(due_at="2026-03-27T10:00:00Z", submission={"workflow_state": "unsubmitted"})
+        self.sc.course[1101]["assignments"] = [dict(sample, id=12000 + n, name=f"Long course task {n} " + "x" * 100)
+                                                for n in range(50)]
+        token = self.command("courses")["actions"][0][0]["data"]
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        sent = []
+        def receive(method, payload=None):
+            if method == "sendMessage":
+                sent.append(payload)
+                if len(sent) == 1:
+                    self.service.switch(_CollectionContext(self.home.archive, quiet=True), False)
+        bot.request = receive
+        bot._execute_callback(token)
+        self.assertEqual(1, len(sent), "已发出的首段可以完成；关闭后后续段不能发送")
+
+
 
     def test_telegram_task_callbacks_are_private_and_paginate(self):
         from cc_telegram import TelegramBot
@@ -587,7 +746,7 @@ class SecureRefresh(unittest.TestCase):
                 self.assertEqual({"type": "chat", "chat_id": 1234}, menus["setMyCommands"]["scope"])
                 self.assertEqual({"chat_id": 1234, "menu_button": {"type": "commands"}}, menus["setChatMenuButton"])
                 commands = menus["setMyCommands"]["commands"]
-                self.assertEqual({"help", "status", "report", "refresh", "tasks", "schedule", "on", "off"}, {c["command"] for c in commands})
+                self.assertEqual({"help", "status", "report", "refresh", "courses", "tasks", "schedule", "on", "off"}, {c["command"] for c in commands})
                 for command in commands:
                     self.assertEqual((command["command"], [], None), bot.parse_command("/" + command["command"]))
                 polls.append(payload)
@@ -664,6 +823,26 @@ class SecureRefresh(unittest.TestCase):
 
 
     def test_daily_plan_reuses_attempt_and_retries_delivery_without_canvas(self):
+    def test_new_course_notice_only_goes_to_discovering_delivery(self):
+        self.sc.courses.append({"id": 1104, "name": "STAT2011 Probability", "course_code": "STAT2011", "_active": True})
+        self.sc.course[1104] = {"assignments": []}
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        manual = self.command("refresh")
+        self.assertIn("新课程：STAT2011", manual["text"])
+        self.service.acknowledge_delivery(manual)
+        due = self.service.scheduled_tick()
+        self.assertNotIn("新课程：STAT2011", due["text"])
+
+    def test_scheduled_course_notice_does_not_echo_in_manual_report(self):
+        self.sc.courses.append({"id": 1104, "name": "STAT2011 Probability", "course_code": "STAT2011", "_active": True})
+        self.sc.course[1104] = {"assignments": []}
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        due = self.service.scheduled_tick()
+        self.assertIn("新课程：STAT2011", due["text"])
+        self.service.scheduled_delivery(due["day"], True)
+        self.assertNotIn("新课程：STAT2011", self.command("report")["text"])
         from unittest.mock import patch
         with patch("cc_schedule.secrets.randbelow", return_value=0):
             self.assertIn("2026-03-24", self.service.execute(1234, "schedule", ["22:45", "UTC"], "telegram", "setting")["text"])

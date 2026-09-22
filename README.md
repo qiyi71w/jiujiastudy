@@ -111,9 +111,9 @@ Linux/POSIX、Python 3.10+，仅用标准库；每个 Canvas 账号使用独立�
    python3 -B tools/cc_telegram.py --home /srv/canvas-account/data --secrets /srv/canvas-account-private/service.json
    ```
 
-支持 `/canvas help`、`/canvas status`、`/canvas report`（已有快照）、`/canvas refresh`（立即采集）、`/canvas on` / `/canvas off`（账号服务开关）、`/canvas tasks`（任务按钮）及 `/canvas schedule HH:MM Area/City`（每日基准时间和 IANA 显示时区）；`/canvas tasks stopped` 查看已停止项。也可直接使用 `/help`、`/on`、`/off` 等命令。help 和 status 都列出设置入口；status 显示服务开关、当地实际计划时刻及最近采集完整性，不访问 Canvas。默认基准时间为 09:00 UTC，初次设置后延迟在 0–15 分钟内抽取。重叠刷新复用进行中的采集，结束后的新请求立即允许，仍遵守 Canvas 服务端限流。未授权私聊和群聊静默忽略。
+支持 `/canvas help`、`/canvas status`、`/canvas report`（已有快照）、`/canvas refresh`（立即采集）、`/canvas on` / `/canvas off`（账号服务开关）、`/canvas courses`（监控课程按钮）、`/canvas tasks`（任务按钮）及 `/canvas schedule HH:MM Area/City`（每日基准时间和 IANA 显示时区）；`/canvas tasks stopped` 查看已停止项。也可直接使用 `/help`、`/on`、`/off` 等命令。help 和 status 都列出设置入口；status 显示服务开关、当地实际计划时刻及最近采集完整性，不访问 Canvas。默认基准时间为 09:00 UTC，初次设置后延迟在 0–15 分钟内抽取。重叠刷新复用进行中的采集，结束后的新请求立即允许，仍遵守 Canvas 服务端限流。未授权私聊和群聊静默忽略。
 
-启动时从同一命令目录注册绑定用户私聊的原生命令菜单；点击输入框旁菜单可选择 `/help`、`/status`、`/report`、`/refresh`、`/on`、`/off`、`/tasks`、`/schedule`。菜单不改变命令鉴权，不向其他私聊或群聊注册。
+启动时从同一命令目录注册绑定用户私聊的原生命令菜单；点击输入框旁菜单可选择 `/help`、`/status`、`/report`、`/refresh`、`/on`、`/off`、`/courses`、`/tasks`、`/schedule`。菜单不改变命令鉴权，不向其他私聊或群聊注册。
 
 `service-report.json` 原子保存当前及上一成功快照、逐课数据时间、最近采集完整性、待通知变化、每个计划日的随机时刻及逐端投递状态。部分失败保留成功课的更新与失败课的旧数据时间；全部失败不推进任务快照，但形成明确标注失败的定时日报。日报包含未来七天待交、逾期未交、日期不明任务、新增改期、最近已提交及新课程，保留来源链接和逐课采集时间。没有待交任务且采集完整时仍给出确认。
 
@@ -123,6 +123,7 @@ Linux/POSIX、Python 3.10+，仅用标准库；每个 Canvas 账号使用独立�
 提交状态以 Canvas 证据为准：已提交未评分、待审阅和豁免不催交；仅有分数不代表已提交，线下及无法确认的状态标记需确认。个人延期使用 Canvas 为请求用户返回的 `due_at`；仅改期不使已提交任务恢复催交，明确的 `redo_request` 才表示要求重新提交。学习完成记录和本地备注不替代提交状态。正文按 Telegram 长度分段，课程文字以转义的预格式文本呈现，来源 URL 保留供打开或复制。
 
 `/canvas tasks` 每页显示最多八项，按钮可翻页或查看已停止项。先点任务的「停止」/「恢复」，再点确认；「取消」不修改提醒。停止时可不填原因，也可选择「线下完成并停止」；已停止列表显示原因。提醒决定只影响催交，不写 Canvas、不授予学校豁免；重启仍保留。成功刷新检测到适用截止时间变化或 Canvas 明确 `redo_request` 时解除停止并通知；已提交/豁免始终优先过滤，单纯评分或批语不会解除停止。按钮仅在绑定的授权私聊有效，旧按钮、重复点击及任务版本变化后须重新打开列表。
+`/canvas courses` 保留自动发现的课程和主动停止的决定：停课后不再拉取其作业，也不会因下一次发现自动加回；重新加入在服务开启时立即采集，关闭时仅保存选择。课程明确失去访问或从成功的在读列表消失时旧任务移出催交区、保留历史并提示确认；作业接口的临时 5xx 仅标记数据过期，不当作退课。
 
 服务只访问身份验证、课程清单及作业/本人提交记录，不读站内信、不下载课件、不写 Canvas、不调用 AI。HTTPS 分页必须留在绑定 origin 的 API 路径，所有 HTTP 重定向均拒绝；需要跳转的站点应由管理员配置最终 HTTPS origin。真实学校特殊提交语义及更多渠道的综合验收见任务 09。
 
