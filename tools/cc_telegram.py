@@ -198,7 +198,7 @@ class TelegramBot:
         if command not in COMMANDS:
             return None, [], "未知命令；使用 /canvas help 查看可用操作。"
         params = parts[1:]
-        if params and not (command == "tasks" and params == ["stopped"]):
+        if params and not (command == "tasks" and params == ["stopped"] or command == "schedule" and len(params) == 2):
             return None, [], "该命令不接受这些参数。"
         return command, params, None
 
@@ -223,7 +223,9 @@ class TelegramBot:
                 authorized = False
             if authorized and isinstance(callback.get("id"), str):
                 try:
-                    result = self.service.task_action(int(self.service.user_id), callback.get("data"))
+                    result = (self.service.execute(int(self.service.user_id), "schedule", [], "telegram", str(update.get("update_id", "")))
+                              if callback.get("data") == "schedule:help" else
+                              self.service.task_action(int(self.service.user_id), callback.get("data")))
                     self.request("answerCallbackQuery", {"callback_query_id": callback["id"]})
                     self.send(result["text"], result.get("actions"))
                 except Exception:
@@ -295,6 +297,20 @@ class TelegramBot:
         except Exception:
             sys.stderr.write("Telegram 命令处理或投递失败；可重新请求快照。\n")
 
+    def _scheduled_once(self):
+        try:
+            with FileLock(os.path.join(self.service.home, "service-telegram-scheduled.lock")):
+                due = self.service.scheduled_tick()
+                if due:
+                    try:
+                        self.send(due["text"])
+                    except Exception:
+                        self.service.scheduled_delivery(due["day"], False)
+                        return
+                    self.service.scheduled_delivery(due["day"], True)
+        except Exception:
+            sys.stderr.write("Telegram 每日扫描或投递失败；将继续重试。\n")
+
     def stop(self) -> None:
         """Signals the long polling loop to stop."""
         self._stopped = True
@@ -327,10 +343,13 @@ class TelegramBot:
             "chat_id": int(self.service.user_id), "menu_button": {"type": "commands"},
         })
 
-        # Keep polling while refresh commands join a shared account collection.
+        # Polling and scheduled delivery use separate workers; neither blocks the other.
         with ThreadPoolExecutor(max_workers=4) as executor:
             offset: int | None = None
+            scheduled = None
             while not self._stopped:
+                if scheduled is None or scheduled.done():
+                    scheduled = executor.submit(self._scheduled_once)
                 payload: dict[str, Any] = {"timeout": 30, "allowed_updates": ["message", "callback_query"]}
                 if offset is not None:
                     payload["offset"] = offset

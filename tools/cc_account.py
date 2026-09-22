@@ -1,12 +1,15 @@
 """Authenticated account commands, per-course snapshots and rule reports."""
 import datetime as dt
 import os
+import re
+import secrets
 import uuid
 
 from cc_collect import refresh_courses, snapshot_from
 from cc_config import Ctx, effective, minimal_state, version_of
 from cc_courses import course_pairs
 from cc_service_security import SecureCanvas, ServiceSecrets
+from cc_schedule import ensure_plan, planned, settings
 from cc_store import FileLock, jload, jsave
 from cc_time import parse_ts
 
@@ -17,6 +20,7 @@ COMMANDS = {
     "report": "查看当前快照日报及数据时间，不访问 Canvas",
     "refresh": "立即重新采集并生成规则日报",
     "tasks": "查看任务、已停止项和确认按钮；/canvas tasks stopped 查看已停止项，不访问 Canvas",
+    "schedule": "设置每日基准时间及 IANA 时区：/canvas schedule HH:MM Area/City",
 
 }
 
@@ -97,6 +101,124 @@ class AccountService:
         result = self._result(self._report(ctx, saved, events), saved)
         result["delivery"] = {"epoch": saved.get("epoch"), "events": [e["id"] for e in events]}
         return result
+
+    def _plan(self, ctx, saved):
+        saved = dict(saved or {"binding": self.binding})
+        ensure_plan(saved, ctx.cfg, ctx.clock.now_utc())
+        return saved
+
+    def next_scan(self, ctx):
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._plan(ctx, self._saved())
+            clock, zone, tz = settings(ctx.cfg)
+            now = ctx.clock.now_utc()
+            _, eligible = ensure_plan(saved, ctx.cfg, now)
+            candidates = [saved["daily_plans"][key]["due"] for key in eligible
+                          if saved["daily_plans"][key]["state"] in ("pending", "collecting")]
+            if not candidates:
+                tomorrow = now.astimezone(tz).date() + dt.timedelta(days=1)
+                key = tomorrow.isoformat()
+                if key not in saved["daily_plans"]:
+                    delay = secrets.randbelow(901)
+                    saved["daily_plans"][key] = {"due": planned(tomorrow, clock, tz, delay),
+                        "delay": delay, "timezone": zone, "time": clock,
+                        "state": "pending", "delivery": {}}
+                candidates = [saved["daily_plans"][tomorrow.isoformat()]["due"]]
+            jsave(self.report_path, saved)
+        return dt.datetime.fromisoformat(min(candidates)).astimezone(tz).isoformat() + " (" + zone + ")"
+
+    def set_schedule(self, ctx, params):
+        if len(params) != 2 or not re.fullmatch(r"\d{2}:\d{2}", params[0]):
+            return self._result("用法：/canvas schedule HH:MM Area/City")
+        try:
+            settings({"service": {"daily_time": params[0], "daily_timezone": params[1]}})
+        except ValueError:
+            return self._result("需要有效的 HH:MM 和 IANA 时区。")
+        # Refresh also writes config.json: serialize settings against that writer.
+        with FileLock(os.path.join(self.home, "service-refresh.lock")):
+            with FileLock(os.path.join(self.home, "service-state.lock")):
+                current = jload(os.path.join(self.home, "config.json"))
+                current.setdefault("service", {}).update(daily_time=params[0], daily_timezone=params[1])
+                jsave(os.path.join(self.home, "config.json"), current)
+                saved = self._saved()
+                if saved:
+                    self._plan(_CollectionContext(self.home, quiet=True), saved)
+                    jsave(self.report_path, saved)
+        return self._result("每日计划已更新；实际下一次：" + self.next_scan(_CollectionContext(self.home, quiet=True)))
+
+    def scheduled_tick(self):
+        """Claim a due plan; a persisted report is delivered without Canvas access."""
+        ctx = self._authorized(self.user_id)
+        now = ctx.clock.now_utc()
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._plan(ctx, self._saved())
+            _, eligible = ensure_plan(saved, ctx.cfg, now)
+            for day in eligible:
+                plan = saved["daily_plans"][day]
+                if plan["state"] == "collecting" and (now - dt.datetime.fromisoformat(plan["claimed_at"])).total_seconds() > 300:
+                    lock = FileLock(os.path.join(self.home, "service-refresh.lock"))
+                    if lock.acquire(blocking=False):
+                        lock.release()
+                        plan["state"] = "pending"  # interrupted before a report was committed
+                if plan["state"] == "pending" and plan["due"] <= now.isoformat():
+                    plan["state"] = "collecting"
+                    plan["claimed_at"] = now.isoformat()
+                    jsave(self.report_path, saved)
+                    break
+            else:
+                day = None
+                jsave(self.report_path, saved)
+        if day is not None:
+            with FileLock(os.path.join(self.home, "service-state.lock")):
+                pending = self._saved()["daily_plans"][day]["state"] == "collecting"
+            if pending:
+                self._collect(plan_day=day)
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved() or {}
+            _, eligible = ensure_plan(saved, ctx.cfg, now)
+            for key in eligible:
+                plan = saved["daily_plans"][key]
+                delivery = plan.get("delivery", {}).get("telegram")
+                if plan["state"] == "formed" and delivery and delivery["state"] == "pending" and delivery["attempts"] < 4 and delivery["next_at"] <= now.isoformat():
+                    return {"day": key, "text": plan["text"]}
+        return None
+
+    def cancel_scheduled(self):
+        """Cancel unformed plans (used by the account switch before delivery)."""
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved()
+            if not saved:
+                return
+            changed = False
+            for plan in saved.get("daily_plans", {}).values():
+                if plan["state"] in ("pending", "collecting"):
+                    plan["state"] = "cancelled"
+                    changed = True
+            if changed:
+                jsave(self.report_path, saved)
+
+
+    def scheduled_delivery(self, day, success):
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved()
+            plan = (saved or {}).get("daily_plans", {}).get(day)
+            if not plan or plan["state"] != "formed":
+                return
+            receipt = plan["delivery"]["telegram"]
+            if receipt["state"] != "pending":
+                return
+            if success:
+                receipt["state"] = "sent"
+                ids = set(plan.get("events", []))
+                for event in saved.get("events", []):
+                    if event["id"] in ids and "scheduled" in event["pending"]:
+                        event["pending"].remove("scheduled")
+                saved["events"] = [event for event in saved.get("events", []) if event["pending"]]
+            else:
+                receipt["attempts"] += 1
+                delay = min(3600, 30 * 2 ** (receipt["attempts"] - 1))
+                receipt["next_at"] = (_CollectionContext(self.home, quiet=True).clock.now_utc() + dt.timedelta(seconds=delay)).isoformat()
+            jsave(self.report_path, saved)
 
     def acknowledge_delivery(self, result):
         """Called only after all message segments reached the initiating channel."""
@@ -234,25 +356,29 @@ class AccountService:
         if (identity != self.user_id or channel != "telegram"
                 or self._binding(secrets) != self.binding):
             raise ValueError("账号绑定已变更，请管理员重启服务")
-        if command not in COMMANDS or (params and not (command == "tasks" and params == ["stopped"])):
+        if command not in COMMANDS or (params and not (command == "tasks" and params == ["stopped"] or command == "schedule" and len(params) == 2)):
             return self._result("命令或参数不支持；使用 /canvas help 查看可用操作。")
         saved = self._saved()
         if command == "help":
-            return self._result("\n".join(f"/canvas {name} — {description}" for name, description in COMMANDS.items()))
+            return {**self._result("\n".join(f"/canvas {name} — {description}" for name, description in COMMANDS.items()) + "\n设置入口：/canvas schedule HH:MM Area/City"),
+                    "actions": [[{"text": "每日扫描设置", "data": "schedule:help"}]]}
         if command == "status":
-            text = "服务：按需刷新；渠道：Telegram 私聊；AI：未启用；计划扫描：未配置。\n"
+            text = "服务：每日扫描；渠道：Telegram 私聊；AI：未启用。\n"
             text += (f"数据截至：{saved.get('collected_at') or '尚无成功数据'}；完整性："
                      + ("完整。" if self._result("", saved)["complete"] else "不完整。")
                      if saved else "尚无成功快照；使用 /canvas refresh。")
-            return self._result(text, saved)
+            return {**self._result(text + "\n实际下次扫描：" + self.next_scan(ctx) + "\n设置：/canvas schedule HH:MM Area/City", saved),
+                    "actions": [[{"text": "每日扫描设置", "data": "schedule:help"}]]}
         if command == "report":
             return self._report_result(ctx, saved)
+        if command == "schedule":
+            return self.set_schedule(ctx, params)
         if command == "tasks":
             return self.task_list(identity, stopped=bool(params))
         saved = self._collect()
         return self._report_result(_CollectionContext(self.home, quiet=True), saved)
 
-    def _collect(self):
+    def _collect(self, plan_day=None):
         """Purpose-neutral collection; only validated commands may join it.
 
         The persisted attempt id distinguishes joining an in-flight request from
@@ -270,6 +396,8 @@ class AccountService:
             if self._binding(secrets) != self.binding:
                 raise ValueError("账号绑定已变更，请管理员重启服务")
             saved = self._saved()
+            if plan_day and saved and saved.get("daily_plans", {}).get(plan_day, {}).get("state") != "collecting":
+                return saved
             if joined and saved and saved.get("last_attempt", {}).get("id") != attempt_id:
                 return saved
             try:
@@ -288,9 +416,11 @@ class AccountService:
         # must not be overwritten by a refresh that was already doing network IO.
         with FileLock(ctx.P("service-state.lock")):
             latest = self._saved()
-            if latest and previous and latest.get("canvas_user_id") == previous.get("canvas_user_id"):
-                previous = latest
-            saved = dict(previous or {"binding": self.binding})
+            if latest and previous and (not latest.get("canvas_user_id") or latest.get("canvas_user_id") == previous.get("canvas_user_id")):
+                saved = dict(latest)
+                saved["canvas_user_id"] = previous.get("canvas_user_id")
+            else:
+                saved = dict(previous or {"binding": self.binding})
             saved.pop("text", None)
             saved.update(format=2)
             saved.setdefault("epoch", uuid.uuid4().hex)
@@ -305,6 +435,14 @@ class AccountService:
             saved["last_attempt"] = {"id": uuid.uuid4().hex, "at": ctx.clock.now_utc().isoformat(),
                                      "complete": snap is not None and not failures,
                                      "promoted": snap is not None, "failures": failures}
+            for plan in saved.get("daily_plans", {}).values():
+                if plan["state"] == "collecting":
+                    events = [e for e in saved["events"] if "scheduled" in e["pending"]]
+                    plan.update(state="formed", formed_at=ctx.clock.now_utc().isoformat(),
+                                text=self._report(ctx, saved, events),
+                                events=[e["id"] for e in events],
+                                delivery={"telegram": {"state": "pending", "attempts": 0,
+                                                       "next_at": plan["due"]}})
             jsave(self.report_path, saved)
         return saved
 

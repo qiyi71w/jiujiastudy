@@ -587,7 +587,7 @@ class SecureRefresh(unittest.TestCase):
                 self.assertEqual({"type": "chat", "chat_id": 1234}, menus["setMyCommands"]["scope"])
                 self.assertEqual({"chat_id": 1234, "menu_button": {"type": "commands"}}, menus["setChatMenuButton"])
                 commands = menus["setMyCommands"]["commands"]
-                self.assertEqual({"help", "status", "report", "refresh", "tasks"}, {c["command"] for c in commands})
+                self.assertEqual({"help", "status", "report", "refresh", "tasks", "schedule"}, {c["command"] for c in commands})
                 for command in commands:
                     self.assertEqual((command["command"], [], None), bot.parse_command("/" + command["command"]))
                 polls.append(payload)
@@ -602,7 +602,7 @@ class SecureRefresh(unittest.TestCase):
             else:
                 raise AssertionError(method)
             return io.BytesIO(json.dumps({"ok": True, "result": result}).encode())
-        with patch.object(urllib.request.OpenerDirector, "open", boundary):
+        with patch.object(bot, "_scheduled_once", return_value=None), patch.object(urllib.request.OpenerDirector, "open", boundary):
             bot.run()
         self.assertEqual(5, polls[1]["offset"])
         self.assertEqual(30, polls[0]["timeout"])
@@ -611,7 +611,10 @@ class SecureRefresh(unittest.TestCase):
         self.assertIn("\U0001f600" * 4000, reconstructed)
         self.assertIn("＠everyone", reconstructed)
         for item in sent:
-            self.assertNotIn("reply_markup", item)
+            if "设置：/canvas schedule" in item["text"]:
+                self.assertEqual("schedule:help", item["reply_markup"]["inline_keyboard"][0][0]["callback_data"])
+            else:
+                self.assertNotIn("reply_markup", item)
             self.assertNotIn("@", item["text"])
             self.assertNotIn("<button>", item["text"])
             self.assertLessEqual(len(html.unescape(item["text"][5:-6]).encode("utf-16-le")) // 2, 3000)
@@ -659,6 +662,142 @@ class SecureRefresh(unittest.TestCase):
                 self.assertIn("ACCT1101", report["text"])
                 self.assertEqual(config_before, Path(self.home.archive, "config.json").read_bytes())
 
+
+    def test_daily_plan_reuses_attempt_and_retries_delivery_without_canvas(self):
+        from unittest.mock import patch
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.assertIn("2026-03-24", self.service.execute(1234, "schedule", ["22:45", "UTC"], "telegram", "setting")["text"])
+        self.server.requests(clear=True)
+        first = self.service.scheduled_tick()
+        self.assertEqual("2026-03-24", first["day"])
+        self.assertIn("Canvas 规则日报", first["text"])
+        count = len(self.server.requests())
+        self.assertGreater(count, 0)
+        self.service.scheduled_delivery(first["day"], False)
+        self.assertIsNone(self.service.scheduled_tick())
+        pin_now("2026-03-24T23:01:00Z")
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        self.assertEqual(first, restarted.scheduled_tick())
+        self.assertEqual(count, len(self.server.requests()))
+        restarted.scheduled_delivery(first["day"], True)
+        self.assertIsNone(restarted.scheduled_tick())
+        self.assertEqual(count, len(self.server.requests()))
+        plan = jload(self.service.report_path)["daily_plans"][first["day"]]
+        self.assertEqual("sent", plan["delivery"]["telegram"]["state"])
+
+    def test_daily_plan_fold_gap_midnight_and_timezone_change(self):
+        import datetime as dt
+        from zoneinfo import ZoneInfo
+        from cc_schedule import planned
+        tz = ZoneInfo("America/New_York")
+        self.assertEqual("2026-11-01T05:30:00+00:00", planned(dt.date(2026, 11, 1), "01:30", tz, 0))
+        self.assertEqual("2026-03-08T07:00:00+00:00", planned(dt.date(2026, 3, 8), "02:30", tz, 0))
+        with patch("cc_schedule.secrets.randbelow", return_value=900):
+            self.service.execute(1234, "schedule", ["23:55", "UTC"], "telegram", "setting")
+        plan = jload(self.service.report_path)["daily_plans"]["2026-03-24"]
+        self.assertEqual("2026-03-25T00:10:00+00:00", plan["due"])
+        self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        changed = jload(self.service.report_path)["daily_plans"]["2026-03-24"]
+        self.assertEqual(900, changed["delay"])
+        self.assertEqual("2026-03-24T22:15:00+00:00", changed["due"])
+
+    def test_daily_report_partial_failure_is_formed_and_not_recollected(self):
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        self.command("refresh")
+        self.server.force_status(r"/courses/1101/assignments", 403)
+        self.server.requests(clear=True)
+        due = self.service.scheduled_tick()
+        self.assertIn("采集失败：ACCT1101", due["text"])
+        self.assertIn("不完整", due["text"])
+        count = len(self.server.requests())
+        self.assertEqual(due, AccountService(self.home.archive, self.secrets_path).scheduled_tick())
+        self.assertEqual(count, len(self.server.requests()))
+        self.assertEqual("formed", jload(self.service.report_path)["daily_plans"][due["day"]]["state"])
+
+    def test_unformed_plan_cancel_and_timezone_edit_does_not_double_scan(self):
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        self.service.cancel_scheduled()
+        self.assertEqual("cancelled", jload(self.service.report_path)["daily_plans"]["2026-03-24"]["state"])
+        self.assertIsNone(self.service.scheduled_tick())
+        self.assertEqual([], self.server.requests())
+        pin_now("2026-03-25T23:00:00Z")
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.scheduled_tick()
+        count = len(self.server.requests())
+        self.service.execute(1234, "schedule", ["08:00", "America/Los_Angeles"], "telegram", "setting")
+        self.assertEqual("2026-03-25", self.service.scheduled_tick()["day"])
+        self.assertEqual(count, len(self.server.requests()))
+
+
+    def test_midnight_due_executes_once_and_skips_old_history(self):
+        with patch("cc_schedule.secrets.randbelow", return_value=900):
+            self.service.execute(1234, "schedule", ["23:55", "UTC"], "telegram", "setting")
+        pin_now("2026-03-25T00:11:00Z")
+        due = self.service.scheduled_tick()
+        self.assertEqual("2026-03-24", due["day"])
+        count = len(self.server.requests())
+        self.service.scheduled_delivery(due["day"], True)
+        self.assertEqual(count, len(self.server.requests()))
+        pin_now("2026-03-28T23:59:00Z")
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            current = AccountService(self.home.archive, self.secrets_path).scheduled_tick()
+        self.assertEqual("2026-03-28", current["day"])
+        plans = jload(self.service.report_path)["daily_plans"]
+        self.assertEqual("formed", plans["2026-03-24"]["state"])
+        self.assertNotIn("2026-03-26", plans)
+        self.assertNotIn("2026-03-27", plans)
+
+    def test_scheduled_first_snapshot_retains_failed_course_on_later_refresh(self):
+        task = self.sc.course[1101]["assignments"][0]
+        task.update(name="Stale scheduled task", due_at="2026-03-27T10:00:00Z",
+                    submission={"workflow_state": "unsubmitted"})
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        first = self.service.scheduled_tick()
+        self.assertIn("Stale scheduled task", first["text"])
+        stamp = self.command("report")["collected_at"]
+        self.server.force_status(r"/courses/1101/assignments", 403)
+        self.sc.course[1102]["assignments"][0].update(name="Updated course task",
+            due_at="2026-03-27T10:00:00Z", submission={"workflow_state": "unsubmitted"})
+        pin_now("2026-03-25T01:00:00Z")
+        partial = self.command("refresh")
+        self.assertIn("Stale scheduled task", partial["text"])
+        self.assertIn(stamp, partial["text"])
+        self.assertIn("Updated course task", partial["text"])
+
+    def test_overlapping_manual_refresh_forms_plan_without_second_collection(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        manual_started, manual_release = threading.Event(), threading.Event()
+        scheduled_ready, scheduled_release = threading.Event(), threading.Event()
+        original_get = SecureCanvas.get
+        def hold_manual(api, path):
+            if path == "/api/v1/users/self" and not manual_started.is_set():
+                manual_started.set()
+                self.assertTrue(manual_release.wait(5))
+            return original_get(api, path)
+        scheduled = AccountService(self.home.archive, self.secrets_path)
+        original_collect = scheduled._collect
+        def hold_scheduled(*args, **kwargs):
+            scheduled_ready.set()
+            self.assertTrue(scheduled_release.wait(5))
+            return original_collect(*args, **kwargs)
+        with patch.object(SecureCanvas, "get", hold_manual), patch.object(scheduled, "_collect", hold_scheduled):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                manual = pool.submit(self.command, "refresh")
+                self.assertTrue(manual_started.wait(5))
+                daily = pool.submit(scheduled.scheduled_tick)
+                self.assertTrue(scheduled_ready.wait(5))
+                manual_release.set()
+                self.assertIn("Canvas 规则日报", manual.result(timeout=5)["text"])
+                scheduled_release.set()
+                self.assertEqual("2026-03-24", daily.result(timeout=5)["day"])
+        requests = [r for r in self.server.requests() if r["path"] == "/api/v1/users/self"]
+        self.assertEqual(1, len(requests))
 
 if __name__ == "__main__":
     unittest.main()
