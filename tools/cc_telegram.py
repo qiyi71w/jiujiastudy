@@ -277,6 +277,13 @@ class TelegramBot:
         generation = self.service.generation()
         if cmd == "refresh" and self.service.permitted(generation):
             self.send(REFRESH_ACK)
+        if cmd == "on" and not self.service.permitted(generation):
+            self.send("正在开启账号服务并刷新 Canvas，请稍候…")
+        if cmd in ("refresh", "on") and executor is not None:
+            executor.submit(self._execute_command, configured_uid, cmd, params, str(update_id), generation)
+        else:
+            self._execute_command(configured_uid, cmd, params, str(update_id), generation)
+
     def _execute_callback(self, data):
         try:
             result = (self.service.execute(int(self.service.user_id), "schedule", [], "telegram", "callback")
@@ -289,11 +296,6 @@ class TelegramBot:
                           permit=(lambda: self.service.permitted(result["generation"])) if "generation" in result else None)
         except Exception:
             sys.stderr.write("Telegram 按钮处理失败。\n")
-
-        if cmd in ("refresh", "on") and executor is not None:
-            executor.submit(self._execute_command, configured_uid, cmd, params, str(update_id), generation)
-        else:
-            self._execute_command(configured_uid, cmd, params, str(update_id), generation)
 
     def _execute_command(self, identity, command, params, correlation_id, expected_generation=None):
         generation = self.service.generation() if expected_generation is None else expected_generation
@@ -336,10 +338,10 @@ class TelegramBot:
                     try:
                         sent = self.send(due["text"], permit=lambda: self.service.permitted(due["generation"]))
                     except Exception:
-                        self.service.scheduled_delivery(due["day"], False, due["generation"])
+                        self.service.scheduled_delivery(due["day"], False, due["generation"], "telegram")
                         return
                     if sent:
-                        self.service.scheduled_delivery(due["day"], True, due["generation"])
+                        self.service.scheduled_delivery(due["day"], True, due["generation"], "telegram")
         except Exception:
             sys.stderr.write("Telegram 每日扫描或投递失败；将继续重试。\n")
 
@@ -374,6 +376,7 @@ class TelegramBot:
         self.request("setChatMenuButton", {
             "chat_id": int(self.service.user_id), "menu_button": {"type": "commands"},
         })
+        self.service.channel_status("telegram", True)
 
         # Polling and scheduled delivery use separate workers; neither blocks the other.
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -388,10 +391,12 @@ class TelegramBot:
                 try:
                     updates = self.request("getUpdates", payload)
                 except ValueError:
+                    self.service.channel_status("telegram", False)
                     time.sleep(self.retry_delay)
                     continue
                 except KeyboardInterrupt:
                     break
+                self.service.channel_status("telegram", True)
                 if isinstance(updates, list):
                     for update in updates:
                         if isinstance(update, dict):

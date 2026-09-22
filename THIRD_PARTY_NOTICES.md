@@ -10,6 +10,7 @@
 | `python-docx` | 同上，要读 .docx | MIT |
 | `tzlocal` | 认电脑时区（认不出就退回按课程时区显示） | MIT |
 | `tzdata` | 这个 Python 自带的时区库不全时 | Apache-2.0 |
+| `discord.py` | 运行 Discord 私信账号服务 | MIT |
 
 不装任何一个，deadline 和本周清单照常工作——这是设计上的硬要求。
 
