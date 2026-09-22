@@ -6,7 +6,6 @@ Restricted to a single pre-configured private user, rejecting all unauthorized m
 groups, and arbitrary routes or recipients.
 """
 import argparse
-import html
 import json
 import os
 import sys
@@ -156,9 +155,8 @@ class TelegramBot:
     def send(self, text: str, actions=None) -> None:
         """Sends sanitized text to the fixed bound chat (self.service.user_id).
 
-        Neutralizes @ and control/bidi characters, splits BEFORE escaping into chunks
-        of <=3000 UTF-16 units, wraps chunks in HTML <pre> to keep content inert,
-        and disables link previews without reply_markup.
+        Neutralizes @ and control/bidi characters, splits into chunks of <=3000
+        UTF-16 units, and sends plain text without markup parsing or link previews.
         """
         if not text:
             return
@@ -168,12 +166,9 @@ class TelegramBot:
         for index, chunk in enumerate(chunks):
             if not chunk:
                 continue
-            escaped = html.escape(chunk)
-            formatted = f"<pre>{escaped}</pre>"
             payload = {
                 "chat_id": int(self.service.user_id),
-                "text": formatted,
-                "parse_mode": "HTML",
+                "text": chunk,
                 "disable_web_page_preview": True,
             }
             if actions and index == len(chunks) - 1:
