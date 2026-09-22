@@ -94,8 +94,30 @@ token 只要给一次：它存在你电脑上的 `~/.config/jiujiastudy/token`�
 - 给人看的：桌面「救驾」文件夹——本周清单、Deadline 雷达，每门课一个文件夹（课件放 Canvas 原件，产出放 AI 做的东西）。
 - 给程序用的：同一个文件夹里的隐藏目录 `.coach`（配置、进度、采集到的原始数据）。
 - token：`~/.config/jiujiastudy/token`，只有你本人的账户能读。以前存在环境变量或钥匙串里的也认。
-- 一切都在你自己的电脑上。这个项目没有服务器，不上传任何东西。你让 AI 读的内容会经过你使用的那家 AI 服务。
+- 本地 Skill 的档案保存在自己的电脑上；可选的 Telegram 账号服务由管理员自行托管，规则日报会发送到 Telegram。你让 AI 读的内容会经过你使用的那家 AI 服务。
 - 发帖、发站内信、交作业：先给你看预览，你说「发」，再弹一个系统确认窗口，**你本人点确定**才真的发送。窗口弹不出来就不发，把链接给你自己交。
+
+## Telegram 私聊账号服务
+
+Linux/POSIX、Python 3.10+，仅用标准库；每个 Canvas 账号使用独立档案、专属 Bot 和管理员预设的 Telegram 数字用户 ID。服务使用出站 HTTPS long polling，无需开放入站端口。先确认学校允许自动访问和第三方托管。
+
+1. 以独立受限系统用户运行；建立仅该用户可访问的档案目录（权限 `0700`），不要复用正在运行本地 Skill 的档案。
+2. 在该目录的 `config.json` 设置 `schema_version: 3`、明确的 `canvas_host`（完整 HTTPS origin，如 `https://canvas.example.edu`）、课程所在地 `course_tz`、显示用 `user_tz`（IANA 时区），以及 `courses: []` 和 `service: {"telegram_user_id": 123456789}`。域名与数字 ID 均由管理员替换成实际绑定；首次刷新按既有规则自动发现课程。不要填入任何 token。
+3. 在仓库和档案之外，用受限编辑器创建秘密 JSON 文件，权限必须为 `0600`，不能是符号链接。字段为 `canvas_origin`（与配置的规范化 origin 完全一致）、`canvas_token`、`telegram_bot_token`。秘密值只写入该文件，不放命令参数、示例、聊天或日志。更换 Canvas 站点必须同步重新绑定秘密；更换 Bot 或授权身份后重启服务。令牌轮换也应重启。
+4. 授权学习者先在 Telegram 打开专属 Bot 私聊。Bot 不得配置 webhook；已有 webhook 时启动会拒绝，不会自动删除。
+5. 用实际绝对路径启动，前台运行可观察安全错误提示：
+
+   ```bash
+   python3 -B tools/cc_telegram.py --home /srv/canvas-account/data --secrets /srv/canvas-account-private/service.json
+   ```
+
+支持 `/canvas help`、`/canvas status`、`/canvas report`、`/canvas refresh`，也可直接使用 `/help` 等命令，不接受额外参数。前三项不访问 Canvas；`refresh` 先确认接收，再绕过本地缓存重新采集，成功后返回规则日报。未授权私聊和群聊静默忽略。
+
+`service-report.json` 原子保存最近成功日报、数据时间和必要作业快照；重启后 `report` 仍可读取。任一必需请求失败不覆盖它。日报复用本地时区和任务筛选规则：未来七天、最近 21 天逾期、日期不明、新增改期、最近七天已提交及新课程；首次作业快照作为基线。学习完成记录不视为 Canvas 已提交。正文按 Telegram 长度分段，课程文字以转义的预格式文本呈现，来源 URL 保留供打开或复制。
+
+服务只访问身份验证、课程清单及作业/本人提交记录，不读站内信、不下载课件、不写 Canvas、不调用 AI。HTTPS 分页必须留在绑定 origin 的 API 路径，所有 HTTP 重定向均拒绝；需要跳转的站点应由管理员配置最终 HTTPS origin。当前入口为手动刷新，状态明确显示未配置计划扫描。重复扫描变化可靠性与并发协调见任务 02；真实学校特殊提交语义验收见任务 09。
+
+离线验证：`python3 -B -m unittest discover -s tests -p test_account_service.py -v`。安全场景使用临时证书的 HTTPS MockCanvas（需要 OpenSSL、POSIX），Telegram API 边界模拟不等于真实平台验收；部署前须用真实测试 Bot 验证授权/未授权身份、群聊拒绝、消息分段和重启。
 
 ## 写作业这件事
 

@@ -109,6 +109,9 @@ class Canvas:
             raise ValueError(f"refusing a non-API URL: {url.split('?')[0]}")
         return url
 
+    def _decode_payload(self, url, body):
+        return json.loads(body.decode("utf-8") or "null")
+
     def get(self, path, max_pages=None):
         url = self.url_of(path)
         items, obj, pages = [], None, 0
@@ -118,7 +121,7 @@ class Canvas:
             if pages > limit:
                 raise CanvasPagingError(f"分页超过 {limit} 页：{path.split('?')[0]}")
             headers, body = self.fetch(url)
-            payload = json.loads(body.decode("utf-8") or "null")
+            payload = self._decode_payload(url, body)
             if isinstance(payload, list):
                 items.extend(payload)
                 url = self._next_link(headers)
