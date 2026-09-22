@@ -3,3 +3,6 @@ __pycache__/
 .coach/
 raw/
 *.zip
+.pi/
+.scratch/
+docs/agents/
