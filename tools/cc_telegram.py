@@ -6,7 +6,6 @@ Restricted to a single pre-configured private user, rejecting all unauthorized m
 groups, and arbitrary routes or recipients.
 """
 import argparse
-import html
 import json
 import os
 import sys
@@ -154,35 +153,34 @@ class TelegramBot:
 
         return res.get("result")
 
-    def send(self, text: str, actions=None, permit=None) -> bool:
+    def send(self, text: str, actions=None, permit=None, start_segment=0, after_segment=None) -> bool:
         """Sends sanitized text to the fixed bound chat (self.service.user_id).
 
-        Neutralizes @ and control/bidi characters, splits BEFORE escaping into chunks
-        of <=3000 UTF-16 units, wraps chunks in HTML <pre> to keep content inert,
-        and disables link previews without reply_markup.
+        Neutralizes @ and control/bidi characters, splits into chunks of <=3000
+        UTF-16 units, and sends plain text without markup parsing or link previews.
         """
         if not text:
             return False
 
         cleaned = _neutralize(text)
         chunks = _split_utf16_units(cleaned, max_units=MAX_UTF16_CHUNK)
-        for index, chunk in enumerate(chunks):
+        for index in range(start_segment, len(chunks)):
+            chunk = chunks[index]
             if permit is not None and not permit():
                 return False
             if not chunk:
                 continue
-            escaped = html.escape(chunk)
-            formatted = f"<pre>{escaped}</pre>"
             payload = {
                 "chat_id": int(self.service.user_id),
-                "text": formatted,
-                "parse_mode": "HTML",
+                "text": chunk,
                 "disable_web_page_preview": True,
             }
             if actions and index == len(chunks) - 1:
                 payload["reply_markup"] = {"inline_keyboard": [[{"text": _neutralize(button["text"]), "callback_data": button["data"]}
                                                                 for button in row] for row in actions]}
             self.request("sendMessage", payload)
+            if after_segment is not None:
+                after_segment(index + 1)
         return True
 
     def parse_command(self, text: str) -> tuple[str | None, list[str], str | None]:
@@ -347,7 +345,10 @@ class TelegramBot:
                 due = self.service.scheduled_tick()
                 if due:
                     try:
-                        sent = self.send(due["text"], permit=lambda: self.service.delivery_permitted(due))
+                        sent = self.send(due["text"], permit=lambda: self.service.delivery_permitted(due),
+                                         start_segment=due["start_segment"],
+                                         after_segment=lambda next_segment: self.service.scheduled_segment(
+                                             due["day"], due["fingerprint"], next_segment, due["generation"]))
                     except Exception:
                         self.service.scheduled_delivery(due["day"], False, due["generation"])
                         return

@@ -101,6 +101,17 @@ class SecureRefresh(unittest.TestCase):
         self.assertIn("ACCT1101", report["text"])
         self.assertIn("失败", report["text"])
 
+    def test_help_and_status_show_current_schedule_without_collecting_when_off(self):
+        self.service.execute(1234, "schedule", ["21:30", "America/New_York"], "telegram", "setting")
+        self.command("off")
+        for command in ("help", "status"):
+            result = self.command(command)
+            self.assertIn("21:30", result["text"])
+            self.assertIn("America/New_York", result["text"])
+            self.assertIn("/canvas settings", result["text"])
+            self.assertEqual(2, len(result["actions"][0]))
+        self.assertEqual([], self.server.requests())
+
     def test_binding_changes_and_unauthorized_identity_cannot_read(self):
         with self.assertRaises(ValueError):
             self.service.execute(4321, "refresh", [], "telegram", "foreign")
@@ -714,7 +725,6 @@ class SecureRefresh(unittest.TestCase):
             thread.join()
 
     def test_telegram_polling_auth_ack_and_safe_segmented_output(self):
-        import html
         import io
         import urllib.request
         from cc_telegram import TelegramBot
@@ -766,17 +776,20 @@ class SecureRefresh(unittest.TestCase):
         self.assertEqual(5, polls[1]["offset"])
         self.assertEqual(30, polls[0]["timeout"])
         self.assertTrue(all(item["chat_id"] == 1234 for item in sent))
-        reconstructed = "".join(html.unescape(item["text"][5:-6]) for item in sent[1:])
+        reconstructed = "".join(item["text"] for item in sent[1:])
         self.assertIn("\U0001f600" * 4000, reconstructed)
         self.assertIn("＠everyone", reconstructed)
+        self.assertIn("<button>＠fake ＠everyone</button>", reconstructed)
         for item in sent:
             if "设置：/canvas settings" in item["text"] or "设置入口：/canvas settings" in item["text"]:
                 self.assertEqual(["schedule:help", "ai:settings"], [button["callback_data"] for button in item["reply_markup"]["inline_keyboard"][0]])
             else:
                 self.assertNotIn("reply_markup", item)
             self.assertNotIn("@", item["text"])
-            self.assertNotIn("<button>", item["text"])
-            self.assertLessEqual(len(html.unescape(item["text"][5:-6]).encode("utf-16-le")) // 2, 3000)
+            self.assertNotIn("parse_mode", item)
+            self.assertNotIn("entities", item)
+            self.assertTrue(item["disable_web_page_preview"])
+            self.assertLessEqual(len(item["text"].encode("utf-16-le")) // 2, 3000)
 
     def test_telegram_errors_do_not_expose_token_urls(self):
         import io
@@ -863,6 +876,47 @@ class SecureRefresh(unittest.TestCase):
         self.assertEqual(count, len(self.server.requests()))
         plan = jload(self.service.report_path)["daily_plans"][first["day"]]
         self.assertEqual("sent", plan["delivery"]["telegram"]["state"])
+
+    def test_scheduled_long_report_retries_only_unconfirmed_segments_after_restart(self):
+        from cc_telegram import TelegramBot
+        self.sc.course[1101]["assignments"][0].update(
+            name="Long report " + "x" * 6500, due_at="2026-03-27T10:00:00Z",
+            submission={"workflow_state": "unsubmitted"})
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
+        sent = []
+        fail_second = [True]
+        def transport(method, payload):
+            if method == "sendMessage":
+                if len(sent) == 1 and fail_second[0]:
+                    fail_second[0] = False
+                    raise ValueError("simulated failed segment")
+                sent.append(payload["text"])
+        with patch.object(bot, "request", side_effect=transport):
+            bot._scheduled_once()
+        self.assertEqual(1, len(sent))
+        count = len(self.server.requests())
+        pin_now("2026-03-24T23:01:00Z")
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        retry_bot = TelegramBot(restarted, restarted.secrets.telegram_bot_token)
+        with patch.object(retry_bot, "request", side_effect=transport):
+            retry_bot._scheduled_once()
+        self.assertGreater(len(sent), 1)
+        self.assertEqual(1, sent.count(sent[0]), "Telegram accepted the first segment already")
+        self.assertEqual("sent", jload(self.service.report_path)["daily_plans"]["2026-03-24"]["delivery"]["telegram"]["state"])
+        self.assertEqual(count, len(self.server.requests()))
+
+    def test_status_exposes_pending_and_sent_telegram_delivery_without_fetch(self):
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
+        due = self.service.scheduled_tick()
+        count = len(self.server.requests())
+        self.service.scheduled_delivery(due["day"], False, due["generation"])
+        self.assertIn("待重试", self.command("status")["text"])
+        self.service.scheduled_delivery(due["day"], True, due["generation"])
+        self.assertIn("已送达", self.command("status")["text"])
+        self.assertEqual(count, len(self.server.requests()))
 
     def test_daily_plan_fold_gap_midnight_and_timezone_change(self):
         import datetime as dt
@@ -1400,6 +1454,5 @@ class SecureRefresh(unittest.TestCase):
         self.assertIn("数据截至", limited["text"])
         self.assertEqual([], self.server.requests())
         self.assertEqual(1, len(received))
-
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,47 @@
+services:
+  account_a:
+    build: .
+    image: jiujiastudy-account:local
+    user: "10001:10001"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    volumes:
+      - type: bind
+        source: ${ACCOUNT_A_DATA:?Set ACCOUNT_A_DATA to account A's private data directory}
+        target: /data
+      - type: bind
+        source: ${ACCOUNT_A_SECRET:?Set ACCOUNT_A_SECRET to account A's private service.json}
+        target: /run/secrets/service.json
+        read_only: true
+    networks: [outbound]
+
+  account_b:
+    build: .
+    image: jiujiastudy-account:local
+    user: "10001:10001"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    volumes:
+      - type: bind
+        source: ${ACCOUNT_B_DATA:?Set ACCOUNT_B_DATA to account B's private data directory}
+        target: /data
+      - type: bind
+        source: ${ACCOUNT_B_SECRET:?Set ACCOUNT_B_SECRET to account B's private service.json}
+        target: /run/secrets/service.json
+        read_only: true
+    networks: [outbound]
+
+networks:
+  outbound: {}

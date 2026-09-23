@@ -1,5 +1,6 @@
 """Authenticated account commands, per-course snapshots and rule reports."""
 import datetime as dt
+import hashlib
 import os
 import re
 import secrets
@@ -417,7 +418,10 @@ class AccountService:
                     text = plan["text"]
                     if ai.get("enabled") and ai.get("summary") and plan.get("ai_text"):
                         text += "\n\n" + plan["ai_text"]
+                    fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    progress = delivery.get("progress", 0) if delivery.get("fingerprint") == fingerprint else 0
                     return {"day": key, "text": text, "generation": generation,
+                            "fingerprint": fingerprint, "start_segment": progress,
                             "ai_revision": saved.get("ai_revision", 0) if plan.get("ai_text") and ai.get("enabled") and ai.get("summary") else None}
         return None
     def delivery_permitted(self, due):
@@ -482,6 +486,23 @@ class AccountService:
             if changed:
                 jsave(self.report_path, saved)
 
+
+    def scheduled_segment(self, day, fingerprint, next_segment, generation):
+        """Record only a Telegram segment whose sendMessage returned success."""
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            if not self.permitted(generation):
+                return
+            saved = self._saved()
+            plan = (saved or {}).get("daily_plans", {}).get(day)
+            receipt = plan.get("delivery", {}).get("telegram") if plan else None
+            if not receipt or plan["state"] != "formed" or receipt["state"] != "pending":
+                return
+            if receipt.get("fingerprint") != fingerprint:
+                receipt["fingerprint"] = fingerprint
+                receipt["progress"] = 0
+            if next_segment == receipt["progress"] + 1:
+                receipt["progress"] = next_segment
+                jsave(self.report_path, saved)
 
     def scheduled_delivery(self, day, success, generation=None):
         with FileLock(os.path.join(self.home, "service-state.lock")):
@@ -712,19 +733,35 @@ class AccountService:
         saved = self._saved()
         ai_revision = (saved or {}).get("ai_revision", 0)
         if command == "help":
-            return {**self._result("\n".join(f"/canvas {name}{' [问题]' if name == 'ai' else ''} — {description}" for name, description in COMMANDS.items()) + "\n设置入口：/canvas settings；/canvas schedule HH:MM Area/City"),
+            daily_time, daily_zone, _ = settings(ctx.cfg)
+            return {**self._result("\n".join(f"/canvas {name}{' [问题]' if name == 'ai' else ''} — {description}" for name, description in COMMANDS.items()) + f"\n当前每日基准时间：{daily_time}（{daily_zone}）；显示时区：{daily_zone}。\n设置入口：/canvas settings；/canvas schedule HH:MM Area/City"),
                     "actions": [[{"text": "每日扫描设置", "data": "schedule:help"}, {"text": "AI 设置", "data": "ai:settings"}]]}
         if command == "status":
             ai, day, used, available = self._ai_state(ctx, saved)
+            daily_time, daily_zone, _ = settings(ctx.cfg)
+            plans = (saved or {}).get("daily_plans", {})
+            formed = [(key, plan) for key, plan in plans.items() if plan.get("state") == "formed"
+                      and plan.get("delivery", {}).get("telegram")]
+            if formed:
+                plan_day, latest = max(formed, key=lambda item: item[1].get("formed_at", ""))
+                receipt = latest["delivery"]["telegram"]
+                state = receipt["state"]
+                delivery_status = ("已送达" if state == "sent" else
+                                   "待投递" if state == "pending" and not receipt.get("attempts") else
+                                   "待重试" if state == "pending" and receipt["attempts"] < 4 else
+                                   "重试已停止" if state == "pending" else "已过期，未送达")
+                channel = f"Telegram 私聊；{plan_day} 日报：{delivery_status}"
+            else:
+                channel = "Telegram 私聊；尚无日报投递记录"
             text = (("服务：每日扫描；" if (saved or {}).get("service_enabled", True) else "服务：已关闭；")
-                    + "渠道：Telegram 私聊；AI：" + ("开启" if ai.get("enabled") else "关闭")
+                    + "渠道：" + channel + "；AI：" + ("开启" if ai.get("enabled") else "关闭")
                     + f"；自动摘要：{'开' if ai.get('summary') else '关'}；公告授权：{'开' if ai.get('announcements') else '关'}；"
-                    + f"额度日 {day}（{(saved or {}).get('ai_quota_zone', settings(ctx.cfg)[1])}）剩余 {max(0, self.secrets.ai_daily_limit - used)}/{self.secrets.ai_daily_limit}"
+                    + f"额度日 {day}（{(saved or {}).get('ai_quota_zone', daily_zone)}）剩余 {max(0, self.secrets.ai_daily_limit - used)}/{self.secrets.ai_daily_limit}"
                     + ("；接口可用。\n" if available and used < self.secrets.ai_daily_limit else "；接口未配置或额度不足。\n"))
             text += (f"数据截至：{saved.get('collected_at') or '尚无成功数据'}；完整性："
                      + ("完整。" if self._result("", saved)["complete"] else "不完整。")
                      if saved else "尚无成功快照；使用 /canvas refresh。")
-            return {**self._result(text + "\n实际下次扫描：" + self.next_scan(ctx) + "\n设置：/canvas settings；/canvas schedule HH:MM Area/City", saved),
+            return {**self._result(text + f"\n每日基准时间：{daily_time}（{daily_zone}）；显示时区：{daily_zone}。\n实际下次扫描：" + self.next_scan(ctx) + "\n设置：/canvas settings；/canvas schedule HH:MM Area/City", saved),
                     "actions": [[{"text": "每日扫描设置", "data": "schedule:help"}, {"text": "AI 设置", "data": "ai:settings"}]]}
         if command == "report":
             return self._report_result(ctx, saved)
