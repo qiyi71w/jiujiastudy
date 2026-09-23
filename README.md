@@ -94,7 +94,7 @@ token 只要给一次：它存在你电脑上的 `~/.config/jiujiastudy/token`�
 - 给人看的：桌面「救驾」文件夹——本周清单、Deadline 雷达，每门课一个文件夹（课件放 Canvas 原件，产出放 AI 做的东西）。
 - 给程序用的：同一个文件夹里的隐藏目录 `.coach`（配置、进度、采集到的原始数据）。
 - token：`~/.config/jiujiastudy/token`，只有你本人的账户能读。以前存在环境变量或钥匙串里的也认。
-- 本地 Skill 的档案保存在自己的电脑上；可选的账号服务由管理员自行托管，规则日报会送到管理员配置的 Telegram 和／或 Discord 专属 Bot 私聊。你让 AI 读的内容会经过你使用的那家 AI 服务。
+- 本地 Skill 的档案保存在自己的电脑上；可选的 Telegram 账号服务由管理员自行托管，规则日报会发送到 Telegram。你让 AI 读的内容会经过你使用的那家 AI 服务。
 - 发帖、发站内信、交作业：先给你看预览，你说「发」，再弹一个系统确认窗口，**你本人点确定**才真的发送。窗口弹不出来就不发，把链接给你自己交。
 
 ## Telegram 私聊账号服务
@@ -128,16 +128,6 @@ Linux/POSIX、Python 3.10+，仅用标准库；每个 Canvas 账号使用独立�
 服务只访问身份验证、课程清单及作业/本人提交记录，不读站内信、不下载课件、不写 Canvas、不调用 AI。HTTPS 分页必须留在绑定 origin 的 API 路径，所有 HTTP 重定向均拒绝；需要跳转的站点应由管理员配置最终 HTTPS origin。真实学校特殊提交语义及更多渠道的综合验收见任务 09。
 
 离线验证：`python3 -B -m unittest discover -s tests -p test_account_service.py -v`。安全场景使用临时证书的 HTTPS MockCanvas（需要 OpenSSL、POSIX），Telegram API 边界模拟不等于真实平台验收；部署前须用真实测试 Bot 验证授权/未授权身份、群聊拒绝、消息分段和重启。
-
-## Discord 私聊与双端账号服务
-
-服务端 Python 3.10+；Discord 渠道另需 `python3 -m pip install -r requirements-discord.txt`。使用独立档案及 `0600` 秘密文件。管理员可在 `config.json` 的 `service` 中只配置 `discord_user_id`（Discord 数字用户 ID），或同时配置 `telegram_user_id` 与 `discord_user_id`；秘密文件对应填写 `discord_bot_token` 和／或 `telegram_bot_token`。两个 ID 必须经管理员确认属于同一学习者；凭据不放入配置、命令行或仓库。频道与 Bot 均专属该 Canvas 账号。
-
-在 Discord Developer Portal 给专属应用开启 Server Install，安装授权包含 `bot` 和 `applications.commands`；学习者须与 Bot 有共同服务器，才能在与 Bot 的私信使用全局 `/canvas` 原生命令。命令注册限制到 `BOT_DM`，群组私信及服务器上下文不可用；授权身份仍由服务端校验。不要配置 Interactions Endpoint URL：接收使用出站 Gateway，无需开放公网入站端口；全局命令可能需要同步时间。学习者须能与该 Bot 建立私聊，管理员不能用服务器频道代收失败日报。
-
-启动已配置渠道（单端或双端）使用 `python3 -B tools/cc_service.py --home /srv/canvas-account/data --secrets /srv/canvas-account-private/service.json`；单独运行 Discord 也可用相同参数调用 `tools/cc_discord.py`，单独 Telegram 入口保持不变。双端须同时运行，不要并行启动两个相同渠道进程。Discord 原生 `/canvas tasks stopped:true` 查看已停止任务，`/canvas schedule time:HH:MM timezone:Area/City` 修改共享扫描时间；其余 help、status、report、refresh、on、off、courses、tasks 与 Telegram 共用账号操作与按钮状态。status 显示渠道最近连接可用性（90 秒内心跳）及共享开关、数据时间和计划；查询不访问 Canvas。定时日报在两个渠道分别记账，只重试失败渠道，不重扫 Canvas；私信不可达绝不回退服务器频道。身份或 Bot 凭据轮换后重启；旧身份的待发送内容不会投递给新身份。
-
-缺少真实测试 Bot、学习者的两端私信及未授权身份时，离线 HTTPS MockCanvas 与受控交互测试只能证明代码边界，不能代替两平台原生验收。安装 Discord 依赖后可运行 `python3 -B -m unittest discover -s tests -p test_account_service.py -v`。
 
 ## 写作业这件事
 

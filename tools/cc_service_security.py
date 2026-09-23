@@ -66,18 +66,14 @@ class ServiceSecrets:
         # must be HTTPS, no userinfo/query/fragment/path except slash
         config_origin = self._canonical_origin(canvas_host)
 
+        # Telegram user ID in config: service.telegram_user_id positive int
         service = config.get("service")
-        if not isinstance(service, dict):
-            raise ValueError("service configuration must be an object")
-        identities = {}
-        for channel in ("telegram", "discord"):
-            user_id = service.get(channel + "_user_id")
-            if user_id is not None:
-                if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
-                    raise ValueError("invalid service." + channel + "_user_id")
-                identities[channel] = user_id
-        if not identities:
-            raise ValueError("at least one private channel identity is required")
+        user_id = None
+        if isinstance(service, dict):
+            user_id = service.get("telegram_user_id")
+
+        if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
+            raise ValueError("invalid service.telegram_user_id in config: must be a positive integer")
 
         # Open secrets file with restricted permissions (O_NOFOLLOW, regular file, no group/other access)
         if not isinstance(secrets_path, (str, bytes, os.PathLike)):
@@ -146,18 +142,13 @@ class ServiceSecrets:
             raise ValueError("invalid canvas_token in secrets: must be a non-empty string")
 
         telegram_bot_token = secret_data.get("telegram_bot_token")
-        discord_bot_token = secret_data.get("discord_bot_token")
-        if "telegram" in identities and not self._is_bot_token(telegram_bot_token):
-            raise ValueError("invalid telegram_bot_token in secrets")
-        if "discord" in identities and (not isinstance(discord_bot_token, str) or not discord_bot_token.strip()):
-            raise ValueError("invalid discord_bot_token in secrets")
+        if not isinstance(telegram_bot_token, str) or not self._is_bot_token(telegram_bot_token):
+            raise ValueError("invalid telegram_bot_token in secrets: must match Bot token syntax")
+
         self.canvas_origin = config_origin
         self.canvas_token = canvas_token.strip()
-        self.telegram_bot_token = telegram_bot_token.strip() if "telegram" in identities else None
-        self.discord_bot_token = discord_bot_token.strip() if "discord" in identities else None
-        self.identities = identities
-        self.user_id = identities.get("telegram")
-        self.discord_user_id = identities.get("discord")
+        self.telegram_bot_token = telegram_bot_token.strip()
+        self.user_id = user_id
 
     @classmethod
     def _is_bot_token(cls, token):

@@ -1,6 +1,5 @@
 """Authenticated account commands, per-course snapshots and rule reports."""
 import datetime as dt
-import hashlib
 import os
 import re
 import secrets
@@ -81,14 +80,8 @@ class AccountService:
 
     @staticmethod
     def _binding(secrets):
-        binding = {"origin": secrets.canvas_origin}
-        if secrets.user_id is not None:
-            binding.update(telegram_user_id=secrets.user_id,
-                           bot_id=secrets.telegram_bot_token.split(":", 1)[0])
-        if secrets.discord_user_id is not None:
-            binding.update(discord_user_id=secrets.discord_user_id,
-                           discord_bot_id=hashlib.sha256(secrets.discord_bot_token.encode()).hexdigest())
-        return binding
+        return {"origin": secrets.canvas_origin, "telegram_user_id": secrets.user_id,
+                "bot_id": secrets.telegram_bot_token.split(":", 1)[0]}
 
     def _saved(self):
         saved = jload(self.report_path)
@@ -104,23 +97,6 @@ class AccountService:
                          "excused": fact.get("excused")}, fact.get("submission_types", []))
             return saved
         return None
-    def channel_status(self, channel, available):
-        if channel not in self.secrets.identities:
-            return
-        with FileLock(os.path.join(self.home, "service-state.lock")):
-            try:
-                current = ServiceSecrets(jload(os.path.join(self.home, "config.json")), self.secrets_path)
-            except ValueError:
-                return
-            if self._binding(current) != self.binding or channel not in current.identities:
-                return
-            saved = jload(self.report_path)
-            saved = saved if saved and saved.get("binding") == self.binding else {"binding": self.binding}
-            saved.setdefault("channel_health", {})[channel] = {
-                "available": bool(available),
-                "at": dt.datetime.now(dt.timezone.utc).isoformat()}
-            jsave(self.report_path, saved)
-
 
     def generation(self):
         saved = self._saved() or {}
@@ -268,11 +244,9 @@ class AccountService:
                 raise _SwitchFailure(generation) from None
             raise
 
-    def scheduled_tick(self, channel="telegram"):
+    def scheduled_tick(self):
         """Claim a due plan; formed reports remain deliverable without another scan."""
-        if channel not in self.secrets.identities:
-            return None
-        ctx = self._authorized(self.secrets.identities[channel], channel)
+        ctx = self._authorized(self.user_id)
         now = ctx.clock.now_utc()
         with FileLock(os.path.join(self.home, "service-state.lock")):
             saved = self._saved() or {}
@@ -305,7 +279,7 @@ class AccountService:
             _, eligible = ensure_plan(saved, ctx.cfg, now)
             for key in eligible:
                 plan = saved["daily_plans"][key]
-                delivery = plan.get("delivery", {}).get(channel)
+                delivery = plan.get("delivery", {}).get("telegram")
                 if plan["state"] == "formed" and delivery and delivery["state"] == "pending" and delivery["attempts"] < 4 and delivery["next_at"] <= now.isoformat():
                     return {"day": key, "text": plan["text"], "generation": generation}
         return None
@@ -325,7 +299,7 @@ class AccountService:
                 jsave(self.report_path, saved)
 
 
-    def scheduled_delivery(self, day, success, generation=None, channel="telegram"):
+    def scheduled_delivery(self, day, success, generation=None):
         with FileLock(os.path.join(self.home, "service-state.lock")):
             saved = self._saved()
             if generation is not None and not self.permitted(generation):
@@ -333,19 +307,16 @@ class AccountService:
             plan = (saved or {}).get("daily_plans", {}).get(day)
             if not plan or plan["state"] != "formed":
                 return
-            receipt = plan.get("delivery", {}).get(channel)
-            if receipt is None:
-                return
+            receipt = plan["delivery"]["telegram"]
             if receipt["state"] != "pending":
                 return
             if success:
                 receipt["state"] = "sent"
-                if all(value["state"] == "sent" for value in plan["delivery"].values()):
-                    ids = set(plan.get("events", []))
-                    for event in saved.get("events", []):
-                        if event["id"] in ids and "scheduled" in event["pending"]:
-                            event["pending"].remove("scheduled")
-                    saved["events"] = [event for event in saved.get("events", []) if event["pending"]]
+                ids = set(plan.get("events", []))
+                for event in saved.get("events", []):
+                    if event["id"] in ids and "scheduled" in event["pending"]:
+                        event["pending"].remove("scheduled")
+                saved["events"] = [event for event in saved.get("events", []) if event["pending"]]
             else:
                 receipt["attempts"] += 1
                 delay = min(3600, 30 * 2 ** (receipt["attempts"] - 1))
@@ -368,11 +339,10 @@ class AccountService:
             saved["events"] = [event for event in saved.get("events", []) if event["pending"]]
             jsave(self.report_path, saved)
 
-    def _authorized(self, identity, channel="telegram"):
+    def _authorized(self, identity):
         ctx = _CollectionContext(self.home, quiet=True)
         secrets = ServiceSecrets(ctx.cfg, self.secrets_path)
-        if (channel not in secrets.identities or identity != secrets.identities[channel]
-                or self._binding(secrets) != self.binding):
+        if identity != self.user_id or self._binding(secrets) != self.binding:
             raise ValueError("账号绑定已变更，请管理员重启服务")
         return ctx
 
@@ -396,57 +366,38 @@ class AccountService:
         return [(cid, code) for cid, code in course_pairs(ctx.cfg, include_inactive=False)
                 if str(cid) not in stopped]
 
-    def course_list(self, identity, channel="telegram", page=0):
-        ctx = self._authorized(identity, channel)
+    def course_list(self, identity):
+        ctx = self._authorized(identity)
         with FileLock(os.path.join(self.home, "service-state.lock")):
-            return self._course_page(ctx, self._saved() or {"binding": self.binding}, page)
-
-    def _course_page(self, ctx, saved, page):
-        stopped = set(saved.get("stopped_courses", []))
-        courses = ctx.cfg.get("courses") or []
-        if page < 0 or page > max(0, (len(courses) - 1) // 8):
-            return self._result("课程列表已过期，请重新打开。")
-        lines = ["监控课程与已停止监控课程"]
-        actions = []
-        for course in courses[page * 8:(page + 1) * 8]:
-            cid = str(course["id"])
-            inactive = bool(course.get("inactive"))
-            paused = cid in stopped
-            state = "已停止监控" if paused else "已结束或失去访问，旧任务暂停提醒" if inactive else "监控中"
-            lines.append(f"{course['code']} · {course.get('name') or course['code']} — {state}")
-            token = uuid.uuid4().hex
-            saved.setdefault("course_buttons", {})[token] = {
-                "cid": cid, "stopped": paused, "inactive": inactive,
-                "at": dt.datetime.now(dt.timezone.utc).timestamp()}
-            actions.append([{"text": ("重新加入" if paused else "停止监控") + " " + course["code"],
-                             "data": "course:" + token}])
-        if not actions:
-            lines.append("尚无课程；开启后使用 /canvas refresh 发现新课。")
-        navigation = []
-        for target, label in ((page - 1, "上一页"), (page + 1, "下一页")):
-            if 0 <= target <= (len(courses) - 1) // 8:
+            saved = self._saved() or {"binding": self.binding}
+            stopped = set(saved.get("stopped_courses", []))
+            lines = ["监控课程与已停止监控课程"]
+            actions = []
+            for course in ctx.cfg.get("courses") or []:
+                cid = str(course["id"])
+                inactive = bool(course.get("inactive"))
+                paused = cid in stopped
+                state = "已停止监控" if paused else "已结束或失去访问，旧任务暂停提醒" if inactive else "监控中"
+                lines.append(f"{course['code']} · {course.get('name') or course['code']} — {state}")
                 token = uuid.uuid4().hex
                 saved.setdefault("course_buttons", {})[token] = {
-                    "page": target, "at": dt.datetime.now(dt.timezone.utc).timestamp()}
-                navigation.append({"text": label, "data": "course:" + token})
-        if navigation:
-            actions.append(navigation)
-        saved["course_buttons"] = dict(list(saved.get("course_buttons", {}).items())[-300:])
-        jsave(self.report_path, saved)
+                    "cid": cid, "stopped": paused, "inactive": inactive,
+                    "at": dt.datetime.now(dt.timezone.utc).timestamp()}
+                actions.append([{"text": ("重新加入" if paused else "停止监控") + " " + course["code"],
+                                 "data": "course:" + token}])
+            if not actions:
+                lines.append("尚无课程；开启后使用 /canvas refresh 发现新课。")
+            saved["course_buttons"] = dict(list(saved.get("course_buttons", {}).items())[-300:])
+            jsave(self.report_path, saved)
         return {**self._result("\n".join(lines), saved), "actions": actions}
 
-    def course_action(self, identity, data, channel="telegram"):
-        ctx = self._authorized(identity, channel)
+    def course_action(self, identity, data):
+        ctx = self._authorized(identity)
         if not isinstance(data, str) or not data.startswith("course:") or len(data) != 39:
             return self._result("按钮无效，请重新打开课程列表。")
         with FileLock(os.path.join(self.home, "service-state.lock")):
             saved = self._saved() or {"binding": self.binding}
             button = saved.get("course_buttons", {}).pop(data[7:], None)
-            if button and "page" in button:
-                if dt.datetime.now(dt.timezone.utc).timestamp() - button["at"] > 900:
-                    jsave(self.report_path, saved)
-                    return self._result("按钮已过期，请重新打开课程列表。")
-                return self._course_page(ctx, saved, button["page"])
             courses = {str(c["id"]): c for c in ctx.cfg.get("courses") or []}
             course = courses.get(button["cid"]) if button else None
             stopped = set(saved.get("stopped_courses", []))
@@ -481,8 +432,8 @@ class AccountService:
                                                        "at": dt.datetime.now(dt.timezone.utc).timestamp()}
         return {"text": label, "data": "task:" + token}
 
-    def task_list(self, identity, stopped=False, page=0, channel="telegram"):
-        ctx = self._authorized(identity, channel)
+    def task_list(self, identity, stopped=False, page=0):
+        ctx = self._authorized(identity)
         with FileLock(os.path.join(self.home, "service-state.lock")):
             saved = self._saved()
             if not saved or not saved.get("snapshot"):
@@ -515,8 +466,8 @@ class AccountService:
             jsave(self.report_path, saved)
         return {**self._result("\n".join(lines), saved), "actions": actions}
 
-    def task_action(self, identity, data, channel="telegram"):
-        ctx = self._authorized(identity, channel)
+    def task_action(self, identity, data):
+        ctx = self._authorized(identity)
         if not isinstance(data, str) or not data.startswith("task:") or len(data) != 37:
             return self._result("按钮无效，请重新打开任务列表。")
         page_request = None
@@ -562,12 +513,16 @@ class AccountService:
                     del saved["reminders"][aid]
                 jsave(self.report_path, saved)
                 return self._result("已停止提醒。" if stopping else "已恢复提醒。", saved)
-        return self.task_list(identity, *page_request, channel=channel)
+        return self.task_list(identity, *page_request)
 
 
     def execute(self, identity, command, params, channel, correlation_id, expected_generation=None):
         # Recheck administrator configuration before every operation, including reads.
-        ctx = self._authorized(identity, channel)
+        ctx = _CollectionContext(self.home, quiet=True)
+        secrets = ServiceSecrets(ctx.cfg, self.secrets_path)
+        if (identity != self.user_id or channel != "telegram"
+                or self._binding(secrets) != self.binding):
+            raise ValueError("账号绑定已变更，请管理员重启服务")
         if command not in COMMANDS or (params and not (command == "tasks" and params == ["stopped"] or command == "schedule" and len(params) == 2)):
             return self._result("命令或参数不支持；使用 /canvas help 查看可用操作。")
         saved = self._saved()
@@ -575,16 +530,7 @@ class AccountService:
             return {**self._result("\n".join(f"/canvas {name} — {description}" for name, description in COMMANDS.items()) + "\n设置入口：/canvas schedule HH:MM Area/City"),
                     "actions": [[{"text": "每日扫描设置", "data": "schedule:help"}]]}
         if command == "status":
-            health = (saved or {}).get("channel_health", {})
-            now = dt.datetime.now(dt.timezone.utc)
-            def availability(name):
-                state = health.get(name, {})
-                at = state.get("at")
-                recent = at and (now - dt.datetime.fromisoformat(at)).total_seconds() < 90
-                return "可用" if recent and state.get("available") else "不可用" if recent else "未连接"
-            channels = "、".join(name.capitalize() + " 私聊（已启用，" + availability(name) + "）"
-                                for name in self.secrets.identities)
-            text = ("服务：每日扫描；" if (saved or {}).get("service_enabled", True) else "服务：已关闭；") + "渠道：" + channels + "；AI：未启用。\n"
+            text = ("服务：每日扫描；" if (saved or {}).get("service_enabled", True) else "服务：已关闭；") + "渠道：Telegram 私聊；AI：未启用。\n"
             text += (f"数据截至：{saved.get('collected_at') or '尚无成功数据'}；完整性："
                      + ("完整。" if self._result("", saved)["complete"] else "不完整。")
                      if saved else "尚无成功快照；使用 /canvas refresh。")
@@ -595,9 +541,9 @@ class AccountService:
         if command == "schedule":
             return self.set_schedule(ctx, params)
         if command == "courses":
-            return self.course_list(identity, channel)
+            return self.course_list(identity)
         if command == "tasks":
-            return self.task_list(identity, stopped=bool(params), channel=channel)
+            return self.task_list(identity, stopped=bool(params))
         if command == "off":
             return self.switch(ctx, False)
         if command == "on":
@@ -684,9 +630,8 @@ class AccountService:
                     plan.update(state="formed", formed_at=ctx.clock.now_utc().isoformat(),
                                 text=self._report(ctx, saved, events),
                                 events=[e["id"] for e in events],
-                                delivery={channel: {"state": "pending", "attempts": 0,
-                                                    "next_at": plan["due"]}
-                                          for channel in self.secrets.identities})
+                                delivery={"telegram": {"state": "pending", "attempts": 0,
+                                                       "next_at": plan["due"]}})
             jsave(self.report_path, saved)
         return saved
 
