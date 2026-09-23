@@ -26,6 +26,7 @@ from cc_account import COMMANDS, _SwitchFailure
 from cc_service_security import _StrictNoRedirectHandler
 from cc_store import FileLock
 REFRESH_ACK = "正在刷新 Canvas 数据，请稍候…"
+AI_ACK = REFRESH_ACK
 REFRESH_FAIL = "刷新失败，本次未生成完整日报；上次成功快照保留。"
 GENERIC_OP_FAIL = "操作失败，请稍后重试。"
 MAX_UTF16_CHUNK = 3000
@@ -198,10 +199,10 @@ class TelegramBot:
             command = parts[0].lower()
         else:
             command = first.removeprefix("/").lower()
-        if command not in COMMANDS:
+        if command not in COMMANDS and command != "ai":
             return None, [], "未知命令；使用 /canvas help 查看可用操作。"
         params = parts[1:]
-        if params and not (command == "tasks" and params == ["stopped"] or command == "schedule" and len(params) == 2):
+        if params and not (command == "tasks" and params == ["stopped"] or command == "schedule" and len(params) == 2 or command == "ai"):
             return None, [], "该命令不接受这些参数。"
         return command, params, None
 
@@ -275,32 +276,37 @@ class TelegramBot:
             return
 
         generation = self.service.generation()
-        if cmd == "refresh" and self.service.permitted(generation):
-            self.send(REFRESH_ACK)
+        if cmd in ("refresh", "ai") and self.service.permitted(generation):
+            self.send(AI_ACK if cmd == "ai" else REFRESH_ACK)
+        if cmd in ("refresh", "on", "ai") and executor is not None:
+            executor.submit(self._execute_command, configured_uid, cmd, params, str(update_id), generation)
+        else:
+            self._execute_command(configured_uid, cmd, params, str(update_id), generation)
+
     def _execute_callback(self, data):
         try:
-            result = (self.service.execute(int(self.service.user_id), "schedule", [], "telegram", "callback")
-                      if data == "schedule:help" else
-                      self.service.course_action(int(self.service.user_id), data)
-                      if isinstance(data, str) and data.startswith("course:") else
-                      self.service.task_action(int(self.service.user_id), data))
+            user_id = int(self.service.user_id)
+            if data == "schedule:help":
+                result = self.service.execute(user_id, "schedule", [], "telegram", "callback")
+            elif isinstance(data, str) and data.startswith("ai:"):
+                result = self.service.ai_settings(user_id, data)
+            elif isinstance(data, str) and data.startswith("course:"):
+                result = self.service.course_action(user_id, data)
+            else:
+                result = self.service.task_action(user_id, data)
             if not result.get("stale"):
                 self.send(result["text"], result.get("actions"),
                           permit=(lambda: self.service.permitted(result["generation"])) if "generation" in result else None)
         except Exception:
             sys.stderr.write("Telegram 按钮处理失败。\n")
 
-        if cmd in ("refresh", "on") and executor is not None:
-            executor.submit(self._execute_command, configured_uid, cmd, params, str(update_id), generation)
-        else:
-            self._execute_command(configured_uid, cmd, params, str(update_id), generation)
-
     def _execute_command(self, identity, command, params, correlation_id, expected_generation=None):
         generation = self.service.generation() if expected_generation is None else expected_generation
         if expected_generation is not None and self.service.generation() != generation:
             return
+        dispatched_permitted = self.service.permitted(generation)
         try:
-            options = {"expected_generation": generation} if command in ("on", "refresh") else {}
+            options = {"expected_generation": generation} if command in ("on", "refresh", "ai") else {}
             result = self.service.execute(identity=identity, command=command, params=params,
                                           channel="telegram", correlation_id=correlation_id, **options)
         except _SwitchFailure as failure:
@@ -308,7 +314,7 @@ class TelegramBot:
             return
         except Exception:
             if command != "on" or self.service.generation() == generation:
-                permit = (lambda: self.service.permitted(generation)) if command == "refresh" else None
+                permit = (lambda: self.service.permitted(generation)) if command in ("refresh", "ai") and dispatched_permitted else None
                 self.send(REFRESH_FAIL if command == "refresh" else GENERIC_OP_FAIL, permit=permit)
             return
         if result.get("stale"):
@@ -319,7 +325,14 @@ class TelegramBot:
                     result = self.service.execute(identity, "report", [], "telegram", correlation_id)
                 if command == "on":
                     generation = result["generation"]
-                permit = (lambda: self.service.permitted(generation)) if command == "on" or command == "refresh" and result.get("delivery") else None
+                elif command == "ai" and "generation" in result:
+                    generation = result["generation"]
+                if command == "ai" and dispatched_permitted:
+                    permit = lambda: self.service.delivery_permitted(
+                        {"generation": generation, "ai_revision": result.get("ai_revision")})
+                else:
+                    permit = (lambda: self.service.permitted(generation)) if (
+                        command == "on" or command == "refresh" and result.get("delivery")) else None
                 sent = self.send(result["text"], result.get("actions"), permit=permit)
                 if sent:
                     self.service.acknowledge_delivery(result)
@@ -334,7 +347,7 @@ class TelegramBot:
                 due = self.service.scheduled_tick()
                 if due:
                     try:
-                        sent = self.send(due["text"], permit=lambda: self.service.permitted(due["generation"]))
+                        sent = self.send(due["text"], permit=lambda: self.service.delivery_permitted(due))
                     except Exception:
                         self.service.scheduled_delivery(due["day"], False, due["generation"])
                         return

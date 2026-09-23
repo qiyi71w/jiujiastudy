@@ -148,6 +148,19 @@ class ServiceSecrets:
         self.canvas_origin = config_origin
         self.canvas_token = canvas_token.strip()
         self.telegram_bot_token = telegram_bot_token.strip()
+        ai_fields = (secret_data.get("ai_origin"), secret_data.get("ai_api_key"), secret_data.get("ai_model"))
+        if any(value is not None for value in ai_fields):
+            if not all(isinstance(value, str) and value.strip() for value in ai_fields):
+                raise ValueError("AI origin, key and model must all be configured")
+            self.ai_origin = self._canonical_origin(ai_fields[0])
+            self.ai_api_key = ai_fields[1]
+            self.ai_model = ai_fields[2]
+        else:
+            self.ai_origin = self.ai_api_key = self.ai_model = None
+        limit = service.get("ai_daily_limit", 0)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+            raise ValueError("invalid administrator AI daily limit")
+        self.ai_daily_limit = limit
         self.user_id = user_id
 
     @classmethod

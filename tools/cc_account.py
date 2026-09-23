@@ -3,15 +3,18 @@ import datetime as dt
 import os
 import re
 import secrets
+from zoneinfo import ZoneInfo
+from urllib.parse import urlencode, urlsplit
 import uuid
 
-from cc_collect import refresh_courses, snapshot_from
+from cc_collect import refresh_courses, snapshot_from, strip_html
 from cc_config import Ctx, effective, minimal_state, version_of
 from cc_courses import course_pairs
 from cc_service_security import SecureCanvas, ServiceSecrets
 from cc_schedule import ensure_plan, planned, settings
 from cc_store import FileLock, jload, jsave
 from cc_time import parse_ts
+from cc_ai import analyze
 
 class _StaleOperation(Exception):
     """The account changed service generation during this operation."""
@@ -28,11 +31,13 @@ COMMANDS = {
     "status": "查看服务及快照状态；关闭时也可用，不访问 Canvas",
     "report": "查看当前快照日报及数据时间；关闭时也可用，不访问 Canvas",
     "refresh": "仅服务开启时立即重新采集并生成规则日报；关闭时拒绝",
+    "ai": "完整即时采集后生成摘要或回答：/canvas ai [问题]；须开启 AI 且有剩余额度；例：/canvas ai 未来七天有哪些待交作业？",
     "courses": "查看监控与已停止课程，通过按钮停止或重新加入；关闭时只保存选择",
     "tasks": "查看任务、已停止项和确认按钮；/canvas tasks stopped 查看已停止项；关闭时也可用，不访问 Canvas",
     "schedule": "设置每日基准时间及 IANA 时区：/canvas schedule HH:MM Area/City；关闭时也可用",
     "on": "开启服务，立即采集并恢复当日计划；已开启时不重复采集",
     "off": "暂停采集、AI 和日报；仍可查看旧报告及管理设置",
+    "settings": "查看或调整 AI、自动摘要及公告正文授权；关闭时可用，不访问 Canvas",
 
 }
 
@@ -77,6 +82,11 @@ class AccountService:
         self.user_id = self.secrets.user_id
         self.binding = self._binding(self.secrets)
         self.report_path = ctx.P("service-report.json")
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved() or {"binding": self.binding}
+            if "ai_quota_zone" not in saved:
+                saved["ai_quota_zone"] = settings(ctx.cfg)[1]
+                jsave(self.report_path, saved)
 
     @staticmethod
     def _binding(secrets):
@@ -110,6 +120,107 @@ class AccountService:
         if not self.permitted(generation):
             raise _StaleOperation()
 
+    def _ai_state(self, ctx, saved):
+        ai = (saved or {}).get("ai", {})
+        zone = (saved or {}).get("ai_quota_zone", settings(ctx.cfg)[1])
+        day = ctx.clock.now_utc().astimezone(ZoneInfo(zone)).date().isoformat()
+        used = (saved or {}).get("ai_usage", {}).get(day, 0)
+        available = bool(self.secrets.ai_origin and self.secrets.ai_daily_limit)
+        return ai, day, used, available
+
+    def ai_settings(self, identity, action=None):
+        ctx = self._authorized(identity)
+        if action == "ai:settings":
+            action = None
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved() or {"binding": self.binding, "ai_quota_zone": settings(ctx.cfg)[1]}
+            ai = saved.setdefault("ai", {"enabled": False, "summary": False, "announcements": False})
+            if action is not None:
+                token = action[3:] if isinstance(action, str) and action.startswith("ai:") else ""
+                button = saved.get("ai_buttons", {}).pop(token, None)
+                if (not button or ctx.clock.now_utc().timestamp() - button["at"] > 900
+                        or bool(ai.get(button["key"])) != button["before"]):
+                    jsave(self.report_path, saved)
+                    return self._result("设置按钮已过期，请重新打开设置。")
+                ai[button["key"]] = not button["before"]
+                saved["ai_revision"] = saved.get("ai_revision", 0) + 1
+                for plan in saved.get("daily_plans", {}).values():
+                    if plan.get("delivery", {}).get("telegram", {}).get("state") == "pending":
+                        plan.pop("ai_text", None)
+                        if plan.get("ai_state") in ("pending", "running"):
+                            plan["ai_state"] = "done"
+                            plan.pop("ai_snapshot", None)
+                if button["key"] == "announcements" and not ai["announcements"]:
+                    for snapshot in (saved.get("snapshot"), saved.get("previous_success")):
+                        if snapshot:
+                            snapshot.pop("ai_announcements", None)
+            ai, day, used, available = self._ai_state(ctx, saved)
+            actions = []
+            for key, label in (("enabled", "AI 主开关"), ("summary", "每日自动摘要"),
+                               ("announcements", "公告正文授权")):
+                token = uuid.uuid4().hex
+                saved.setdefault("ai_buttons", {})[token] = {"key": key, "before": bool(ai.get(key)),
+                                                              "at": ctx.clock.now_utc().timestamp()}
+                actions.append([{"text": label + ("：关" if ai.get(key) else "：开"), "data": "ai:" + token}])
+            saved["ai_buttons"] = dict(list(saved["ai_buttons"].items())[-300:])
+            jsave(self.report_path, saved)
+        limit = self.secrets.ai_daily_limit
+        text = ("AI 设置（仅绑定私聊）：\n"
+                f"主开关：{'开' if ai.get('enabled') else '关'}；每日自动摘要：{'开' if ai.get('summary') else '关'}；"
+                f"公告正文授权：{'开' if ai.get('announcements') else '关'}。\n"
+                f"管理员额度日：{day}（{saved['ai_quota_zone']}）；剩余：{max(0, limit - used)}/{limit}；"
+                f"{'可用' if available and used < limit else '未配置或额度不足'}。")
+        return {**self._result(text, saved), "actions": actions}
+
+    @staticmethod
+    def _ai_unavailable(ai, used, available, limit):
+        if not ai.get("enabled"):
+            return "AI 未启用；可在设置中开启。"
+        if not available:
+            return "管理员尚未配置 AI 接口或每日额度。"
+        if used >= limit:
+            return "AI 今日额度已用尽。"
+        return None
+
+    def _reserve_ai(self, ctx, generation):
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            self._require(generation)
+            saved = self._saved()
+            ai, day, used, available = self._ai_state(ctx, saved)
+            reason = self._ai_unavailable(ai, used, available, self.secrets.ai_daily_limit)
+            if reason:
+                return reason
+            saved.setdefault("ai_usage", {})[day] = used + 1
+            saved["ai_usage"] = {key: value for key, value in saved["ai_usage"].items() if key >= day}
+            jsave(self.report_path, saved)
+        return None
+    def _require_ai(self, generation, revision):
+        self._require(generation)
+        saved = self._saved() or {}
+        if saved.get("ai_revision", 0) != revision or not saved.get("ai", {}).get("enabled"):
+            raise _StaleOperation()
+
+    def _ai_input(self, ctx, saved, snapshot):
+        active = {str(cid) for cid, _ in self._monitored(ctx, saved)}
+        def safe_url(value):
+            if not isinstance(value, str):
+                return None
+            try:
+                url = urlsplit(value)
+            except ValueError:
+                return None
+            if (url.scheme != "https" or url.username or url.password
+                    or f"https://{url.netloc.lower()}" != self.secrets.canvas_origin):
+                return None
+            return url._replace(query="", fragment="").geturl()
+        assignments = {}
+        for aid, fact in snapshot.get("assignments", {}).items():
+            if fact.get("course_id") in active:
+                assignments[aid] = {key: fact.get(key) for key in ("course", "name", "due_at", "sub_state")}
+                assignments[aid]["html_url"] = safe_url(fact.get("html_url"))
+        announcements = [{"source": safe_url(ann.get("source")), "text": ann.get("text")}
+                         for ann in snapshot.get("ai_announcements", [])]
+        return {"assignments": assignments}, [ann for ann in announcements if ann["source"]]
 
     @staticmethod
     def _result(text, saved=None):
@@ -211,6 +322,9 @@ class AccountService:
                 for plan in saved.get("daily_plans", {}).values():
                     if plan["state"] == "collecting":
                         plan["state"] = "cancelled"
+                    if plan.get("ai_state") in ("pending", "running"):
+                        plan["ai_state"] = "done"
+                        plan.pop("ai_snapshot", None)
             jsave(self.report_path, saved)
         try:
             collected = self._collect(plan_day=day, generation=generation) if enabled else saved
@@ -274,6 +388,22 @@ class AccountService:
             self._collect(plan_day=day, generation=generation)
         with FileLock(os.path.join(self.home, "service-state.lock")):
             saved = self._saved() or {}
+            _, eligible = ensure_plan(saved, ctx.cfg, now)
+            for key in eligible:
+                plan = saved["daily_plans"][key]
+                started = plan.get("ai_started_at")
+                if (plan.get("ai_state") == "running" and started
+                        and (now - dt.datetime.fromisoformat(started)).total_seconds() > 60):
+                    plan["ai_state"] = "done"
+                    plan.pop("ai_snapshot", None)
+                    plan["ai_text"] = "AI 自动摘要未完成；规则日报仍可查看。"
+                    jsave(self.report_path, saved)
+            summaries = [key for key in eligible if saved["daily_plans"][key].get("state") == "formed"
+                         and saved["daily_plans"][key].get("ai_state") == "pending"]
+        for key in summaries:
+            self._auto_summary(key, generation)
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved() or {}
             if not self.permitted(generation):
                 return None
             _, eligible = ensure_plan(saved, ctx.cfg, now)
@@ -281,8 +411,62 @@ class AccountService:
                 plan = saved["daily_plans"][key]
                 delivery = plan.get("delivery", {}).get("telegram")
                 if plan["state"] == "formed" and delivery and delivery["state"] == "pending" and delivery["attempts"] < 4 and delivery["next_at"] <= now.isoformat():
-                    return {"day": key, "text": plan["text"], "generation": generation}
+                    if plan.get("ai_state") in ("pending", "running"):
+                        return None
+                    ai = saved.get("ai", {})
+                    text = plan["text"]
+                    if ai.get("enabled") and ai.get("summary") and plan.get("ai_text"):
+                        text += "\n\n" + plan["ai_text"]
+                    return {"day": key, "text": text, "generation": generation,
+                            "ai_revision": saved.get("ai_revision", 0) if plan.get("ai_text") and ai.get("enabled") and ai.get("summary") else None}
         return None
+    def delivery_permitted(self, due):
+        saved = self._saved() or {}
+        return (self.permitted(due["generation"]) and
+                (due.get("ai_revision") is None or saved.get("ai_revision", 0) == due["ai_revision"]))
+    def _auto_summary(self, day, generation):
+        ctx = _CollectionContext(self.home, quiet=True)
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            if not self.permitted(generation):
+                return
+            saved = self._saved()
+            plan = saved.get("daily_plans", {}).get(day)
+            if not plan or plan.get("ai_state") != "pending":
+                return
+            if not saved.get("ai", {}).get("enabled") or not saved["ai"].get("summary"):
+                plan["ai_state"] = "done"
+                plan.pop("ai_snapshot", None)
+                jsave(self.report_path, saved)
+                return
+            plan["ai_state"] = "running"
+            plan["ai_started_at"] = ctx.clock.now_utc().isoformat()
+            revision = saved.get("ai_revision", 0)
+            snapshot, allowed_announcements = self._ai_input(ctx, saved, plan.get("ai_snapshot") or {})
+            announcements = allowed_announcements if saved["ai"].get("announcements") else None
+            jsave(self.report_path, saved)
+        try:
+            reason = self._reserve_ai(ctx, generation)
+            if reason:
+                text = "AI 自动摘要未执行：" + reason
+            else:
+                text = "AI 自动摘要（非 Canvas 事实）：\n" + analyze(
+                    self.secrets.ai_origin, self.secrets.ai_api_key, self.secrets.ai_model,
+                    snapshot, announcements=announcements, permit=lambda: self._require_ai(generation, revision))
+                if announcements:
+                    text += "\n公告涉及的日期仅供参考，待确认；来源：" + "、".join(a["source"] for a in announcements)
+        except Exception:
+            text = "AI 自动摘要失败或超时；规则日报仍可查看。"
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved()
+            if not self.permitted(generation):
+                return
+            plan = saved.get("daily_plans", {}).get(day)
+            if plan and plan.get("ai_state") == "running":
+                plan["ai_state"] = "done"
+                plan.pop("ai_snapshot", None)
+                if saved.get("ai_revision", 0) == revision:
+                    plan["ai_text"] = text
+                jsave(self.report_path, saved)
 
     def cancel_scheduled(self):
         """Cancel unformed plans (used by the account switch before delivery)."""
@@ -523,23 +707,31 @@ class AccountService:
         if (identity != self.user_id or channel != "telegram"
                 or self._binding(secrets) != self.binding):
             raise ValueError("账号绑定已变更，请管理员重启服务")
-        if command not in COMMANDS or (params and not (command == "tasks" and params == ["stopped"] or command == "schedule" and len(params) == 2)):
+        if command not in COMMANDS or (params and not (command == "tasks" and params == ["stopped"] or command == "schedule" and len(params) == 2 or command == "ai")):
             return self._result("命令或参数不支持；使用 /canvas help 查看可用操作。")
         saved = self._saved()
+        ai_revision = (saved or {}).get("ai_revision", 0)
         if command == "help":
-            return {**self._result("\n".join(f"/canvas {name} — {description}" for name, description in COMMANDS.items()) + "\n设置入口：/canvas schedule HH:MM Area/City"),
-                    "actions": [[{"text": "每日扫描设置", "data": "schedule:help"}]]}
+            return {**self._result("\n".join(f"/canvas {name}{' [问题]' if name == 'ai' else ''} — {description}" for name, description in COMMANDS.items()) + "\n设置入口：/canvas settings；/canvas schedule HH:MM Area/City"),
+                    "actions": [[{"text": "每日扫描设置", "data": "schedule:help"}, {"text": "AI 设置", "data": "ai:settings"}]]}
         if command == "status":
-            text = ("服务：每日扫描；" if (saved or {}).get("service_enabled", True) else "服务：已关闭；") + "渠道：Telegram 私聊；AI：未启用。\n"
+            ai, day, used, available = self._ai_state(ctx, saved)
+            text = (("服务：每日扫描；" if (saved or {}).get("service_enabled", True) else "服务：已关闭；")
+                    + "渠道：Telegram 私聊；AI：" + ("开启" if ai.get("enabled") else "关闭")
+                    + f"；自动摘要：{'开' if ai.get('summary') else '关'}；公告授权：{'开' if ai.get('announcements') else '关'}；"
+                    + f"额度日 {day}（{(saved or {}).get('ai_quota_zone', settings(ctx.cfg)[1])}）剩余 {max(0, self.secrets.ai_daily_limit - used)}/{self.secrets.ai_daily_limit}"
+                    + ("；接口可用。\n" if available and used < self.secrets.ai_daily_limit else "；接口未配置或额度不足。\n"))
             text += (f"数据截至：{saved.get('collected_at') or '尚无成功数据'}；完整性："
                      + ("完整。" if self._result("", saved)["complete"] else "不完整。")
                      if saved else "尚无成功快照；使用 /canvas refresh。")
-            return {**self._result(text + "\n实际下次扫描：" + self.next_scan(ctx) + "\n设置：/canvas schedule HH:MM Area/City", saved),
-                    "actions": [[{"text": "每日扫描设置", "data": "schedule:help"}]]}
+            return {**self._result(text + "\n实际下次扫描：" + self.next_scan(ctx) + "\n设置：/canvas settings；/canvas schedule HH:MM Area/City", saved),
+                    "actions": [[{"text": "每日扫描设置", "data": "schedule:help"}, {"text": "AI 设置", "data": "ai:settings"}]]}
         if command == "report":
             return self._report_result(ctx, saved)
         if command == "schedule":
             return self.set_schedule(ctx, params)
+        if command == "settings":
+            return self.ai_settings(identity)
         if command == "courses":
             return self.course_list(identity)
         if command == "tasks":
@@ -551,10 +743,50 @@ class AccountService:
         generation = self.generation() if expected_generation is None else expected_generation
         if not self.permitted(generation):
             return self._result("服务已关闭；/canvas refresh 和 AI 不可用，请使用 /canvas on 开启。", saved)
+        if command == "ai":
+            latest = self._saved()
+            ai, _, used, available = self._ai_state(ctx, latest)
+            reason = self._ai_unavailable(ai, used, available, self.secrets.ai_daily_limit)
+            if reason:
+                result = self._report_result(ctx, latest)
+                result["text"] += "\nAI 解读未执行：" + reason
+                result["generation"] = generation
+                return result
         collected = self._collect(generation=generation)
         if not self.permitted(generation):
             return {**self._result("本次采集已失效；服务状态已变化。"), "stale": True}
-        return self._report_result(_CollectionContext(self.home, quiet=True), collected)
+        result = self._report_result(_CollectionContext(self.home, quiet=True), collected)
+        if command == "ai" and (self._saved() or {}).get("ai_revision", 0) != ai_revision:
+            return {**self._result("本次 AI 解读已失效。"), "stale": True}
+        if command != "ai":
+            return result
+        if not result["complete"] or collected.get("last_attempt", {}).get("ai_failure"):
+            result["text"] += ("\nAI 解读未执行：公告采集失败。" if collected.get("last_attempt", {}).get("ai_failure")
+                               else "\nAI 解读未执行：本次采集不完整。")
+            result["generation"] = generation
+            return result
+        reason = self._reserve_ai(ctx, generation)
+        if reason:
+            result["text"] += "\nAI 解读未执行：" + reason
+        else:
+            try:
+                snapshot, allowed_announcements = self._ai_input(ctx, collected, collected["snapshot"])
+                announcements = allowed_announcements if collected.get("ai", {}).get("announcements") else None
+                model_text = analyze(self.secrets.ai_origin, self.secrets.ai_api_key,
+                                     self.secrets.ai_model, snapshot,
+                                     " ".join(params) if params else None, announcements,
+                                     permit=lambda: self._require_ai(generation, ai_revision))
+                result["text"] += "\n\nAI 解读（非 Canvas 事实）：\n" + model_text
+                if announcements:
+                    result["text"] += "\n公告涉及的日期仅供参考，待确认；来源：" + "、".join(
+                        a["source"] for a in announcements)
+                result["ai_revision"] = ai_revision
+            except Exception:
+                result["text"] += "\nAI 解读失败或超时；规则日报不受影响。"
+        result["generation"] = generation
+        if not self.permitted(generation) or (self._saved() or {}).get("ai_revision", 0) != ai_revision:
+            return {**self._result("本次 AI 解读已失效。"), "stale": True}
+        return result
 
     def _collect(self, plan_day=None, generation=None, required_course=None):
         """Purpose-neutral collection; only validated commands may join it.
@@ -596,7 +828,7 @@ class AccountService:
     def _failed(self, ctx, previous, failures, generation):
         return self._commit(ctx, previous, None, [], failures, generation)
 
-    def _commit(self, ctx, previous, snap, course_changes, failures, generation, collected_courses=(), scheduled=False):
+    def _commit(self, ctx, previous, snap, course_changes, failures, generation, collected_courses=(), scheduled=False, ai_failure=False):
         # Collection and delivery have separate locks: a late send acknowledgement
         # must not be overwritten by a refresh that was already doing network IO.
         with FileLock(ctx.P("service-state.lock")):
@@ -621,9 +853,12 @@ class AccountService:
             saved["last_attempt"] = {"id": uuid.uuid4().hex, "at": ctx.clock.now_utc().isoformat(),
                                      "complete": snap is not None and not failures,
                                      "promoted": snap is not None, "failures": failures,
+                                     "ai_complete": snap is not None and not failures and not ai_failure,
+                                     "ai_failure": ai_failure,
                                      "collected_courses": [str(c["id"]) for c in ctx.cfg.get("courses") or []
                                                            if str(c["id"]) in collected_courses
                                                            and str(c["id"]) not in saved.get("stopped_courses", [])]}
+            ai = saved.get("ai", {})
             for plan in saved.get("daily_plans", {}).values():
                 if plan["state"] == "collecting":
                     events = [e for e in saved["events"] if "scheduled" in e["pending"]]
@@ -632,6 +867,12 @@ class AccountService:
                                 events=[e["id"] for e in events],
                                 delivery={"telegram": {"state": "pending", "attempts": 0,
                                                        "next_at": plan["due"]}})
+                    plan["ai_state"] = ("pending" if saved["last_attempt"]["ai_complete"]
+                                        and ai.get("enabled") and ai.get("summary") else "done")
+                    if plan["ai_state"] == "pending":
+                        plan["ai_snapshot"] = snap
+                    elif ai_failure and ai.get("enabled") and ai.get("summary"):
+                        plan["ai_text"] = "AI 自动摘要未执行：公告采集失败；规则日报仍可查看。"
             jsave(self.report_path, saved)
         return saved
 
@@ -740,6 +981,26 @@ class AccountService:
                 failures.append({"course": code, "kind": "assignments"})
             except Exception:
                 failures.append({"course": code, "kind": "assignments"})
+        announcements = []
+        announcement_error = False
+        if not failures and (self._saved() or {}).get("ai", {}).get("enabled") and (self._saved() or {}).get("ai", {}).get("announcements") and assignments:
+            try:
+                query = urlencode([("context_codes[]", "course_" + str(cid)) for cid in assignments])
+                values = api.get("/api/v1/announcements?" + query + "&per_page=50")
+                if not isinstance(values, list):
+                    raise ValueError("公告采集失败")
+                codes = {"course_" + str(cid): code for cid, code in courses if str(cid) in assignments}
+                for value in values[:50]:
+                    if not isinstance(value, dict):
+                        raise ValueError("公告采集失败")
+                    code = codes.get(value.get("context_code"))
+                    if code and isinstance(value.get("html_url"), str):
+                        announcements.append({"course": code, "text": strip_html(value.get("message"), 1500),
+                                              "source": value["html_url"], "title": value.get("title")})
+            except _StaleOperation:
+                raise
+            except Exception:
+                announcement_error = True
         ctx.cfg = effective(ctx.raw_cfg)
         if failures and not assignments:
             self._require(generation)
@@ -772,10 +1033,13 @@ class AccountService:
             if str(cid) in assignments:
                 freshness[code] = now
                 by_id[str(cid)] = now
+        if announcements:
+            snap["ai_announcements"] = announcements
         snap.update(collected_at=now, complete=not failures, course_freshness=freshness,
                     course_freshness_by_id=by_id, baseline=not bool(old))
         self._require(generation)
-        result = self._commit(ctx, previous, snap, changes, failures, generation, assignments, scheduled)
+        result = self._commit(ctx, previous, snap, changes, failures, generation, assignments, scheduled,
+                              ai_failure=announcement_error)
         self._require(generation)
         jsave(ctx.P("config.json"), ctx.raw_cfg)
         return result
@@ -833,13 +1097,15 @@ class AccountService:
             lines.append("首次成功快照作为基线，已有作业不计新增。")
         if attempt and not attempt.get("promoted", True):
             lines.append("刷新全部失败；本次未更新任务数据，上一成功快照保留。")
-        if failures:
+        if failures or attempt.get("ai_failure"):
             lines.append(f"本次尝试时间：{attempt['at']}")
         for failure in failures:
             course = failure["course"]
             label = course or "账号验证或课程清单"
             stamp = snap.get("course_freshness", {}).get(course) or "尚无成功数据"
             lines.append(f"采集失败：{label}；旧数据截至：{stamp}；无法确认当前提交状态。")
+        if attempt.get("ai_failure"):
+            lines.append("公告采集失败：公告正文不可用；监控课程作业和提交状态仍按本次数据时间显示。")
         for code, stamp in sorted(snap.get("course_freshness", {}).items()):
             lines.append(f"课程数据：{code}，截至 {stamp}")
         if not snap:
