@@ -265,7 +265,10 @@ class TestWebAuthLifecycle(unittest.TestCase):
             "--username", "cli_admin",
             "--password-stdin",
         ]
-        with patch("sys.stdin", io.StringIO("cli_password_123456\n")):
+        with io.TextIOWrapper(io.BytesIO(), encoding="cp1252") as stdout, \
+             io.TextIOWrapper(io.BytesIO(), encoding="cp1252") as stderr, \
+             patch("sys.stdout", stdout), patch("sys.stderr", stderr), \
+             patch("sys.stdin", io.StringIO("cli_password_123456\n")):
             code = main(argv)
         self.assertEqual(code, 0)
         auth = WebAuth(self.test_dir, self.account_id)

@@ -17,6 +17,7 @@ import sys
 import time
 from typing import Any
 
+from canvas_api import utf8_stdout
 from cc_store import FileLock, jsave
 
 # Argon2id 密码哈希支持
@@ -461,6 +462,7 @@ class WebAuth:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI 管理入口：支持通过 getpass 或 --password-stdin 初始化/重置账号密码。"""
+    utf8_stdout()
     parser = argparse.ArgumentParser(prog="cc_web_auth", description="WebAuth CLI 管理工具")
     parser.add_argument("--home", required=True, help="账号主目录")
     parser.add_argument("--account-id", required=True, help="账号标识")
