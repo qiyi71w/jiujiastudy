@@ -44,7 +44,7 @@ def private_json(path):
         return json.load(stream)
 
 
-def atomic(path, content, uid=10001, gid=10001, mode=0o600):
+def atomic(path, content, uid=10001, gid=10001, mode=0o600, *, exclusive=False):
     path = Path(path)
     if path.is_symlink():
         raise AdminError("拒绝替换符号链接。")
@@ -56,7 +56,10 @@ def atomic(path, content, uid=10001, gid=10001, mode=0o600):
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(tmp, path)
+        if exclusive:
+            os.link(tmp, path)
+        else:
+            os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -99,17 +102,47 @@ HOME_ROOT = Path("/srv/jiujiastudy")
 PRIVATE_ROOT = Path("/srv/jiujiastudy-private")
 
 
+def _web_origin(origin):
+    try:
+        if (ServiceSecrets._canonical_origin(origin) != origin
+                or urllib.parse.urlsplit(origin).port is not None):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise AdminError("网站地址须为规范 HTTPS 地址，使用小写域名，不含端口、路径、查询、片段或用户凭据。") from None
+    return origin
+
+
+def initialize_registry(origin):
+    origin = _web_origin(origin)
+    if REGISTRY.exists() or REGISTRY.is_symlink():
+        raise AdminError("注册表已存在，拒绝覆盖网站地址或账号目录。")
+    parent = REGISTRY.parent
+    if parent.is_symlink():
+        raise AdminError("注册表目录不能是符号链接。")
+    if not parent.exists():
+        parent.mkdir(mode=0o755, parents=True)
+        parent.chmod(0o755)
+    data = {"origin": origin, "accounts": []}
+    try:
+        atomic(REGISTRY, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode(),
+               0, 0, 0o644, exclusive=True)
+    except FileExistsError:
+        raise AdminError("注册表已存在，拒绝覆盖网站地址或账号目录。") from None
+    print(f"网站配置已初始化：{origin}\n注册表：{REGISTRY}")
+
+
 def registry():
     path = REGISTRY
     if path.is_symlink() or not path.is_file():
-        raise AdminError("共享入口注册表尚未初始化；请先迁移已有账号。")
+        raise AdminError("注册表不存在或不是普通文件；首次部署请运行账号管理向导，已有配置请检查 --registry 路径。")
     meta = path.stat()
     if meta.st_uid != 0 or stat.S_IMODE(meta.st_mode) != 0o644:
         raise AdminError("共享入口注册表须由 root 拥有且权限为 0644。")
     try:
         data = json.loads(path.read_text())
-        if set(data) != {"origin", "accounts"} or data["origin"] != "https://study.qiyi71w.com":
+        if not isinstance(data, dict) or set(data) != {"origin", "accounts"}:
             raise ValueError()
+        _web_origin(data["origin"])
         entries = data["accounts"]
         if not isinstance(entries, list):
             raise ValueError()
@@ -126,7 +159,7 @@ def registry():
             names.add(username); ids.add(account_id); ports.add(port)
         return data
     except (OSError, ValueError, TypeError, KeyError):
-        raise AdminError("共享入口注册表格式无效或存在重复账号。") from None
+        raise AdminError("共享入口注册表无效：origin 须为规范 HTTPS 地址（不含端口、路径、查询或片段），账号不得重复。") from None
 
 
 def save_registry(data):
@@ -392,15 +425,29 @@ def create(values, image=None):
 
 
 def main(argv=None):
+    global REGISTRY
     parser = argparse.ArgumentParser(description="救驾服务器账号管理后端；请使用 account-wizard.sh")
-    parser.add_argument("action", choices=("status", "create", "rotate", "password"))
+    parser.add_argument("action", choices=("init", "origin", "status", "create", "rotate", "password"))
     parser.add_argument("--image", help="新增账号使用的本地应用镜像；默认沿用唯一运行中的账号镜像")
+    parser.add_argument("--registry", type=Path, default=REGISTRY, help="与网关共用的注册表绝对路径")
+    parser.add_argument("--origin", help="首次初始化的网站 HTTPS 地址；仅用于 init")
     args = parser.parse_args(argv)
+    if not args.registry.is_absolute():
+        parser.error("--registry 必须为绝对路径")
+    if (args.action == "init") != (args.origin is not None):
+        parser.error("init 必须提供 --origin，其他操作不能指定 --origin")
     os.umask(0o077)
     if os.geteuid() != 0:
         raise AdminError("请通过 sudo 在 Docker 所在服务器运行向导。")
+    REGISTRY = args.registry
     # Serialize host lifecycle operations, distinct from per-account application state locks.
     with FileLock("/run/lock/jiujiastudy-admin.lock"):
+        if args.action == "init":
+            initialize_registry(args.origin)
+            return
+        if args.action == "origin":
+            print(registry()["origin"])
+            return
         if args.action == "status":
             status()
             return

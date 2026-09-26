@@ -192,15 +192,47 @@ umask 077
 ENV_FILE=/dev/null
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${PYTHON:-python3}"
-if [[ "${1:-}" == --help ]]; then
-  printf '%s\n' '用法：sudo tools/account-wizard.sh [--image 本地应用镜像]' \
-    '在 Docker 所在 Linux 服务器运行；Token 与密码仅隐藏输入。' \
-    '请先初始化共享入口注册表并部署网关。'
-  exit 0
-fi
+REGISTRY=/srv/jiujiastudy/gateway/registry.json
+IMAGE_ARGS=()
+while (( $# )); do
+  case "$1" in
+    --registry|--image)
+      [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { say "$1 需要一个值。"; exit 2; }
+      if [[ "$1" == --registry ]]; then REGISTRY="$2"; else IMAGE_ARGS=(--image "$2"); fi
+      shift 2
+      ;;
+    --help|-h)
+      printf '%s\n' '用法：sudo tools/account-wizard.sh [--registry 注册表绝对路径] [--image 本地应用镜像]' \
+        '默认注册表：/srv/jiujiastudy/gateway/registry.json。须与网关使用同一份文件。' \
+        '首次运行输入网站 HTTPS 地址并确认，创建空账号目录；配置网关及 HTTPS 后再次运行开户。' \
+        '在 Docker 所在 Linux 服务器运行；Token 与密码仅隐藏输入。'
+      exit 0
+      ;;
+    *) say "未知参数：$1"; exit 2 ;;
+  esac
+done
+[[ "$REGISTRY" == /* ]] || { say '--registry 必须为绝对路径。'; exit 2; }
+ADMIN=("$PYTHON" "$SCRIPT_DIR/cc_admin.py" --registry "$REGISTRY")
 [[ -t 0 && -t 1 ]] || { printf '%s\n' '需要交互式终端，拒绝从管道读取敏感输入。' >&2; exit 1; }
 [[ "$EUID" == 0 ]] || { printf '%s\n' '请通过 sudo 在部署服务器运行。' >&2; exit 1; }
 trap 'unset CANVAS_TOKEN PASSWORD PASSWORD_AGAIN' EXIT
+
+say "注册表：$REGISTRY"
+if [[ ! -e "$REGISTRY" && ! -L "$REGISTRY" ]]; then
+  TOTAL_STAGES=1
+  stage '首次配置网站'
+  ask WEB_ORIGIN '网站 HTTPS 地址（例如 https://study.example.org，不含路径或尾部斜杠）：'
+  say "网站：$WEB_ORIGIN"
+  say "将创建注册表：$REGISTRY；账号目录初始为空。"
+  confirm '确认保存此网站配置？' || { say '已取消，未创建配置。'; exit 0; }
+  "${ADMIN[@]}" init --origin "$WEB_ORIGIN"
+  say '下一步：配置此域名的 DNS、HTTPS 反向代理及网关，让网关读取同一份注册表。'
+  say '网关部署完成后，用相同 --registry 参数再次运行向导开户；首个账号需指定 --image。'
+  exit 0
+fi
+WEB_ORIGIN=$("${ADMIN[@]}" origin)
+say "已配置网站：$WEB_ORIGIN"
+confirm '确认管理此网站的账号？' || { say '已取消，配置未修改。'; exit 0; }
 
 say '救驾账号管理'
 say '1. 新增账号'
@@ -215,7 +247,7 @@ case "$CHOICE" in
     ask SLUG '账号名称（小写字母、数字、下划线）：'
     ask CANVAS_ORIGIN '学校 Canvas HTTPS 网址（不含路径）：'
     ask TIMEZONE '课程及显示时区（例如 America/Toronto）：'
-    say '所有账号使用同一网页登录入口：https://study.qiyi71w.com。'
+    say "所有账号使用同一网页登录入口：$WEB_ORIGIN。"
     stage 'Canvas 凭据'
     say '在学校 Canvas：Account → Settings → Approved Integrations → New Access Token。'
     say '服务器无法代你生成 Token；请在自己电脑的浏览器操作。'
@@ -230,41 +262,41 @@ case "$CHOICE" in
     ask_secret PASSWORD_AGAIN '再次输入网页密码：'
     [[ "$PASSWORD" == "$PASSWORD_AGAIN" ]] || { say '两次密码不一致，未创建账号。'; exit 1; }
     stage '确认创建'
-    "$PYTHON" "$SCRIPT_DIR/cc_admin.py" status
+    "${ADMIN[@]}" status
     say '可选：复用已有账号的 AI 供应商配置，不复制其数据或授权。会使用同一供应商账单。'
     ask AI_SOURCE '来源容器完整名称（直接回车跳过）：'
-    say "账号：$SLUG；Canvas：$CANVAS_ORIGIN；网页：https://study.qiyi71w.com；用户名：$USERNAME；时区：$TIMEZONE"
+    say "账号：$SLUG；Canvas：$CANVAS_ORIGIN；网页：$WEB_ORIGIN；用户名：$USERNAME；时区：$TIMEZONE"
     say '默认每日 AI 上限 20；AI 授权关闭。将只读校验 Canvas 身份，再通过共享入口校验登录并启用每日扫描。'
     confirm '确认以上站点属于预期学校，并创建账号？' || { say '已取消，未创建账号。'; exit 0; }
     stage '部署与完成检查'
     printf '%s\0' "$SLUG" "$CANVAS_ORIGIN" "$CANVAS_TOKEN" "$USERNAME" "$PASSWORD" "$TIMEZONE" "$AI_SOURCE" |
-      "$PYTHON" "$SCRIPT_DIR/cc_admin.py" create "$@"
+      "${ADMIN[@]}" create "${IMAGE_ARGS[@]}"
     ;;
   2)
     TOTAL_STAGES=2
     stage '选择账号'
-    "$PYTHON" "$SCRIPT_DIR/cc_admin.py" status
+    "${ADMIN[@]}" status
     ask ACCOUNT '复制完整容器名称：'
     stage '更新 Token'
     say '请在原学校 Canvas 的 Account → Settings 中生成新 Token，必须属于原 Canvas 身份。'
     ask_secret CANVAS_TOKEN '新 Canvas Token（隐藏输入）：'
     confirm '校验身份并短暂重启此账号？' || exit 0
-    printf '%s\0' "$ACCOUNT" "$CANVAS_TOKEN" | "$PYTHON" "$SCRIPT_DIR/cc_admin.py" rotate
+    printf '%s\0' "$ACCOUNT" "$CANVAS_TOKEN" | "${ADMIN[@]}" rotate
     ;;
   3)
     TOTAL_STAGES=2
     stage '选择账号'
-    "$PYTHON" "$SCRIPT_DIR/cc_admin.py" status
+    "${ADMIN[@]}" status
     ask ACCOUNT '复制完整容器名称：'
     stage '重设网页密码'
     ask_secret PASSWORD '新密码（12–256 字符，隐藏输入）：'
     ask_secret PASSWORD_AGAIN '再次输入新密码：'
     [[ "$PASSWORD" == "$PASSWORD_AGAIN" ]] || { say '两次密码不一致，未修改。'; exit 1; }
     confirm '重设密码并撤销这个账号的全部旧会话？' || exit 0
-    printf '%s\0' "$ACCOUNT" "$PASSWORD" | "$PYTHON" "$SCRIPT_DIR/cc_admin.py" password
+    printf '%s\0' "$ACCOUNT" "$PASSWORD" | "${ADMIN[@]}" password
     ;;
   4)
-    "$PYTHON" "$SCRIPT_DIR/cc_admin.py" status
+    "${ADMIN[@]}" status
     ;;
   *) say '请选择 1、2、3 或 4。'; exit 1 ;;
 esac

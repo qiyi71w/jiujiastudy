@@ -58,6 +58,11 @@ ever aims at this computer (two local ports, a numeric address resolved with
 output streams and verifies that password provisioning succeeds; the command configures
 UTF-8 output before printing Chinese diagnostics.
 
+`test_admin_wizard.py` covers registry initialization, origin validation, preservation of
+existing accounts and malformed files, symlink rejection, and concurrent initialization
+without overwriting another configuration. Account tests also cover Token identity checks,
+failed-health rollback and cleanup limited to a failed new account.
+
 `test_doctor.py` checks doctor against the mock: exit 0 after a successful first
 setup and on the next run, 1 once set up but not connected, 2 when nothing can be
 set up; and the skill-location check (SKILL.md directly under a skills folder a

@@ -1,5 +1,7 @@
 # Canvas 多账号提醒服务实施计划
 
+项目公开服务器版源码，供部署者在自己的服务器上运行。本文记录的 `study.qiyi71w.com` 是维护者的私人部署实例；部署时应使用自己的域名、凭据和服务器资源。
+
 状态：用户已批准用户名密码网站、网页与 Telegram 共用设置、可选 Telegram 自动通知、公告已读过滤及结构化救驾摘要；本次按下述网站扩展契约实施。既有任务验收记录保留。
 领域词汇见 [CONTEXT.md](CONTEXT.md)。本文中的阶段均属于完整交付范围，不代表可以省略后续功能。
 
@@ -24,7 +26,7 @@
 
 ### 统一入口迁移证据（2026-09-25）
 
-- 所有账号共用 `https://study.qiyi71w.com`；网关按唯一用户名验证登录，以 HMAC 签名 Cookie 绑定账号及其后台会话，后台继续独立鉴权、校验 CSRF 和撤销会话。账号容器、数据、秘密、额度及扫描保持独立；无公开注册。
+- 该私人实例的所有账号共用 `https://study.qiyi71w.com`；网关按唯一用户名验证登录，以 HMAC 签名 Cookie 绑定账号及其后台会话，后台继续独立鉴权、校验 CSRF 和撤销会话。账号容器、数据、秘密、额度及扫描保持独立；无公开注册。
 - 管理向导已取消逐账号域名和证书邮箱，改为校验独立后台后原子登记共享目录，再通过公共入口验证账号身份。重复用户名被拒绝，失败回滚仅清理本次账号；Token 更新及密码重设只选择目录内匹配账号。
 - 管理向导与网关13项检查通过；签名 Cookie 简化后网关和既有鉴权25项检查通过。两个真实 `AccountService` / `WebAuth` HTTP 后台的隔离冒烟验证登录、各自状态与改密只撤销本账号，Canvas 请求为零。生产向导实际 PTY 菜单可查询 `qiyi`，每日 AI 上限仍为20。
 - 网关镜像 `jiujiastudy-account:unified-20260925` 已上线，回环端口 `18079`（`18080` 由 1Panel 占用）；OpenResty 已切换，HTTPS 健康与静态资源200，未登录状态401，未知用户401，旧后台 Cookie 不再作为公共入口会话。原 `jiujiastudy-account-a` 容器保持运行，配置、认证文件和学习状态逐字节保留；未读取用户密码，未代用户登录生产账号，未触发 Canvas 或模型调用。
@@ -356,11 +358,25 @@ Linux/POSIX、Python 3.10+；先安装 `python3 -m pip install -r requirements.t
 
 #### 服务器账号管理向导
 
+向导与网关共用一份注册表，网站地址以其中的 `origin` 为准。向导默认使用 `/srv/jiujiastudy/gateway/registry.json`，也可通过 `--registry <绝对路径>` 显式指定位置。首次运行时，向导询问自己的 HTTPS 网站地址；管理员确认后创建注册表和空账号目录，例如：
+
+```json
+{"origin": "https://study.example.org", "accounts": []}
+```
+
+初始化只创建新文件，已有配置、账号目录、无效文件或符号链接均不会被覆盖。程序先校验地址，再以 root 所有、`0644` 权限原子创建注册表；缺失的父目录自动建立，注册表所在新目录为 `0755`。`origin` 使用小写域名的规范 HTTPS 地址，不带显式端口、尾部斜杠、路径、查询、片段或用户凭据。取消确认或地址校验失败不会创建配置。
+
+首次初始化后向导退出，提示配置该域名的 DNS、HTTPS 反向代理和网关；不会自动申请证书或启动网关。让网关通过自己的 `--registry` 参数读取同一份文件；容器部署时只读挂载注册表所在目录，参数使用容器内的对应路径，以便看到后续原子更新。准备 `/srv/jiujiastudy`、`/srv/jiujiastudy-private` 目录和本地应用镜像后，用相同的 `--registry` 参数再次运行向导，首个账号还需指定 `--image <已构建镜像名>`。
+
+已有配置时，向导先校验注册表、显示网站地址并请求确认，再进入管理菜单。开户、Token 更新、改密及状态查询全部使用选定的注册表，基本信息、确认页、新账号配置和登录检查使用其中的地址。无效配置直接报错，不转入初始化。
+
+可用 `sudo python3 tools/cc_admin.py --registry <绝对路径> origin` 单独检查配置；该命令只打印通过校验的网站地址，不读取开户凭据或连接 Canvas。需要命令行初始化时，使用 `sudo python3 tools/cc_admin.py --registry <绝对路径> init --origin https://study.example.org`，替换为自己的域名；该命令同样拒绝覆盖已有文件。
+
 在运行 Docker 与 HTTPS 反向代理的 Linux 服务器上，管理员可重复执行 `sudo tools/account-wizard.sh`，选择新增账号、更新 Canvas Token、重设网页密码或查看状态。甲骨文部署机已安装快捷命令 `sudo jiujiastudy-admin`，程序位于 `/opt/jiujiastudy-admin`，无需进入仓库目录。脚本要求交互式终端；Token 与密码隐藏输入，经标准输入传给管理程序，不进入命令参数、环境变量或日志。仅标准部署的 UID/GID 10001、单账号独立容器可由向导管理；已有账号不被覆盖。若机器上多个运行中的应用镜像版本不同，新增时显式传入 `--image <已构建镜像名>`。
 
-所有学习者使用同一个 HTTPS 网站，以各自用户名和密码登录。管理员先部署统一网关，并在 `/srv/jiujiastudy/gateway/registry.json` 维护网站 origin 与账号目录；每项包含唯一 `username`、`account_id`、宿主回环 `port`。目录不保存密码或 Canvas Token。网关只读挂载目录，使用独立受限签名密钥绑定浏览器会话与后台账号；各后台继续校验自己的密码、会话和 CSRF。后台不对公网暴露，各账号数据、凭据、额度和扫描保持独立。
+所有学习者使用同一个 HTTPS 网站，以各自用户名和密码登录。管理员在所选注册表中维护网站 origin 与账号目录；每项包含唯一 `username`、`account_id`、宿主回环 `port`。目录不保存密码或 Canvas Token。网关只读挂载目录，使用独立受限签名密钥绑定浏览器会话与后台账号；各后台继续校验自己的密码、会话和 CSRF。后台不对公网暴露，各账号数据、凭据、额度和扫描保持独立。
 
-当前统一入口为 `https://study.qiyi71w.com`。生产网关容器 `jiujiastudy-gateway` 使用 host 网络，但只监听 `127.0.0.1:18079`；OpenResty 将该网站转发到此端口。原账号后台仍监听 `127.0.0.1:18081`。网关启动命令为 `python -B /app/tools/cc_gateway.py --registry /registry/registry.json --key /run/secrets/gateway.key --listen 127.0.0.1 --port 18079`；只读挂载整个注册表目录到 `/registry`，确保原子更新立即可见。注册表由 root 持有、权限 `0644`；密钥至少32个随机字节，宿主路径 `/srv/jiujiastudy-private/gateway/gateway.key`，UID/GID `10001:10001`、权限 `0600`，单独只读挂载。网关不挂载学习档案、Canvas 秘密或 Docker socket。
+维护者私人实例的统一入口为 `https://study.qiyi71w.com`。生产网关容器 `jiujiastudy-gateway` 使用 host 网络，但只监听 `127.0.0.1:18079`；OpenResty 将该网站转发到此端口。原账号后台仍监听 `127.0.0.1:18081`。网关启动命令为 `python -B /app/tools/cc_gateway.py --registry /registry/registry.json --key /run/secrets/gateway.key --listen 127.0.0.1 --port 18079`；只读挂载整个注册表目录到 `/registry`，确保原子更新立即可见。注册表由 root 持有、权限 `0644`；密钥至少32个随机字节，宿主路径 `/srv/jiujiastudy-private/gateway/gateway.key`，UID/GID `10001:10001`、权限 `0600`，单独只读挂载。网关不挂载学习档案、Canvas 秘密或 Docker socket。
 
 新增向导只收集账号名称、Canvas 网址、Token、网页用户名、密码和时区，可选复用已有账号的 AI 供应商配置。无需逐用户填写域名或证书邮箱，也不再为每人申请证书。管理员只维护统一网站的 DNS、HTTPS 和反向代理。向导只读验证 Canvas 身份，拒绝重复用户名或身份；后台初始化并通过检查后加入统一目录，确认网站登录到正确账号后才启用扫描。每日 AI 上限 20 次，AI 主开关与公告授权默认关闭；未配置供应商时不可调用模型，复用供应商会共享供应商账单，不共享学习数据或授权。
 

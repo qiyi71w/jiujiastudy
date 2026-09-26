@@ -60,6 +60,84 @@ class AccountAdministration(unittest.TestCase):
         self.assertEqual("new-token", admin.private_json(self.secret)["canvas_token"])
         self.assertEqual(["stop", "start", "stop", "start"], [a[1] for a in operations])
 
+    def test_initialize_registry_creates_config_and_preserves_existing_accounts(self):
+        registry_file = self.home / "gateway" / "registry.json"
+        with patch.object(admin, "REGISTRY", registry_file), patch.object(admin.os, "fchown"):
+            admin.initialize_registry("https://study.example.org")
+            self.assertEqual({"origin": "https://study.example.org", "accounts": []},
+                             json.loads(registry_file.read_text()))
+            self.assertEqual(0o644, registry_file.stat().st_mode & 0o777)
+            self.assertEqual(0o755, registry_file.parent.stat().st_mode & 0o777)
+            registered = {"origin": "https://study.example.org", "accounts": [
+                {"username": "learner", "account_id": "stable-id", "port": 18081}]}
+            registry_file.write_text(json.dumps(registered))
+            original = registry_file.read_bytes()
+            for origin in ("https://study.example.org", "https://other.example.org"):
+                with self.subTest(origin=origin):
+                    with self.assertRaises(admin.AdminError):
+                        admin.initialize_registry(origin)
+                    self.assertEqual(original, registry_file.read_bytes())
+
+    def test_invalid_initial_origin_does_not_create_directory(self):
+        registry_file = self.home / "gateway" / "registry.json"
+        with patch.object(admin, "REGISTRY", registry_file):
+            for origin in ("http://study.example.org", "https://study.example.org/login", ""):
+                with self.subTest(origin=origin):
+                    with self.assertRaises(admin.AdminError):
+                        admin.initialize_registry(origin)
+                    self.assertFalse(registry_file.parent.exists())
+
+    def test_initialization_does_not_replace_corrupt_file_or_symlink(self):
+        registry_file = self.home / "registry.json"
+        with patch.object(admin, "REGISTRY", registry_file):
+            registry_file.write_text("incomplete existing configuration")
+            original = registry_file.read_bytes()
+            with self.assertRaises(admin.AdminError):
+                admin.initialize_registry("https://study.example.org")
+            self.assertEqual(original, registry_file.read_bytes())
+            registry_file.unlink()
+            target = self.home / "missing-target"
+            registry_file.symlink_to(target)
+            with self.assertRaises(admin.AdminError):
+                admin.initialize_registry("https://study.example.org")
+            self.assertTrue(registry_file.is_symlink())
+            self.assertFalse(target.exists())
+
+    def test_concurrent_initialization_cannot_overwrite_winner(self):
+        registry_file = self.home / "registry.json"
+        original_link = os.link
+        winner = {"origin": "https://other.example.org", "accounts": []}
+
+        def competing_link(source, destination):
+            registry_file.write_text(json.dumps(winner))
+            original_link(source, destination)
+
+        with patch.object(admin, "REGISTRY", registry_file), patch.object(admin.os, "fchown"), \
+             patch.object(admin.os, "link", side_effect=competing_link):
+            with self.assertRaises(admin.AdminError):
+                admin.initialize_registry("https://study.example.org")
+        self.assertEqual(winner, json.loads(registry_file.read_text()))
+        self.assertEqual([], list(self.home.glob(".admin-*")))
+
+    def test_registry_accepts_deployment_origin_and_rejects_non_origins(self):
+        registry_file = self.home / "registry.json"
+        original_stat = Path.stat
+        with patch.object(admin, "REGISTRY", registry_file), patch.object(admin.Path, "stat", autospec=True) as stat:
+            stat.side_effect = lambda path, *a, **kw: (type("Owner", (), {"st_uid": 0, "st_mode": 0o100644})()
+                if path == registry_file else original_stat(path, *a, **kw))
+            for origin in ("https://study.example.org", "https://learn.example.edu"):
+                with self.subTest(origin=origin):
+                    registry_file.write_text(json.dumps({"origin": origin, "accounts": []}))
+                    self.assertEqual(origin, admin.registry()["origin"])
+            for origin in (None, "", "http://study.example.org", "https://user:pass@study.example.org",
+                           "https://study.example.org:8443", "https://study.example.org:443",
+                           "https://study.example.org/", "https://study.example.org/login",
+                           "https://study.example.org?next=other", "https://study.example.org#login"):
+                with self.subTest(origin=origin):
+                    registry_file.write_text(json.dumps({"origin": origin, "accounts": []}))
+                    with self.assertRaises(admin.AdminError):
+                        admin.registry()
+
     def test_registry_rejects_duplicate_identity_and_port(self):
         registry_file = self.home / "registry.json"
         entry = {"username": "learner", "account_id": "stable-id", "port": 18081}
@@ -70,13 +148,13 @@ class AccountAdministration(unittest.TestCase):
             for duplicate in ({"username": "learner", "account_id": "other", "port": 18082},
                               {"username": "other", "account_id": "stable-id", "port": 18082},
                               {"username": "other", "account_id": "other", "port": 18081}):
-                registry_file.write_text(json.dumps({"origin": "https://study.qiyi71w.com",
+                registry_file.write_text(json.dumps({"origin": "https://study.example.org",
                     "accounts": [entry, duplicate]}))
                 with self.assertRaises(admin.AdminError):
                     admin.registry()
 
     def test_unregistered_or_mismatched_container_is_not_selectable(self):
-        registered = {"origin": "https://study.qiyi71w.com", "accounts": [
+        registered = {"origin": "https://study.example.org", "accounts": [
             {"username": "learner", "account_id": "isolated-account", "port": 18888}]}
         self.config["service"]["web_origin"] = registered["origin"]
         admin.atomic(self.home / "config.json", json.dumps(self.config).encode(), os.getuid(), os.getgid())
@@ -97,7 +175,7 @@ class AccountAdministration(unittest.TestCase):
                 admin.selected(self.row[0])
 
     def test_duplicate_username_rejected_before_provisioning(self):
-        registered = {"origin": "https://study.qiyi71w.com", "accounts": [
+        registered = {"origin": "https://study.example.org", "accounts": [
             {"username": "learner", "account_id": "stable-id", "port": 18081}]}
         with patch.object(admin, "registry", return_value=registered), \
              patch.object(admin, "run") as run:
@@ -108,10 +186,11 @@ class AccountAdministration(unittest.TestCase):
 
     def test_failed_public_login_removes_only_new_account(self):
         existing = {"username": "existing", "account_id": "original", "port": 18081}
-        state = {"origin": "https://study.qiyi71w.com", "accounts": [existing.copy()]}
+        state = {"origin": "https://study.example.org", "accounts": [existing.copy()]}
         root = Path(self.temp.name)
         public_seen = []
         commands = []
+        login_requests = []
 
         def own_save(path, data):
             if path.name == "config.json":
@@ -135,7 +214,7 @@ class AccountAdministration(unittest.TestCase):
 
         class FailedLogin:
             def open(self, request, timeout):
-                self.request = request
+                login_requests.append(request)
                 raise admin.AdminError("公网登录检查失败。")
 
         with patch.object(admin, "HOME_ROOT", root), patch.object(admin, "PRIVATE_ROOT", root / "private"), \
@@ -159,7 +238,9 @@ class AccountAdministration(unittest.TestCase):
         self.assertFalse((root / "private" / "new").exists())
         self.assertIn(("docker", "rm", "-f", "jiujiastudy-account-new"), commands)
         self.assertNotIn(("docker", "rm", "-f", "jiujiastudy-account-existing"), commands)
-        self.assertEqual("https://study.qiyi71w.com", public_seen[0]["origin"])
+        self.assertEqual("https://study.example.org", public_seen[0]["origin"])
+        self.assertEqual("https://study.example.org/api/login", login_requests[0].full_url)
+        self.assertEqual("https://study.example.org", login_requests[0].get_header("Origin"))
 
 
 if __name__ == "__main__":
