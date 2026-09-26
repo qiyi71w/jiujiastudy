@@ -1,18 +1,21 @@
 # Tests
 
-Offline, standard library only:
+Install the website dependencies with `python -m pip install -r requirements.txt`, then run the offline suite:
 
     python -B -m unittest discover -s tests -v
 
-About half a minute. Nothing talks to the internet: `mockcanvas.py` serves synthetic
-Canvas data on 127.0.0.1, and `_coach_runner.py` refuses every other connection,
-DNS lookup and child process. When a test unsets `CANVAS_TOKEN`, the runner also
+Tests use synthetic Canvas and model responses on localhost. The CLI runner refuses external
+connections, DNS lookups and child processes. When a test unsets `CANVAS_TOKEN`, the runner also
 hides the Windows registry, so a token saved on the computer is never read.
+
+Account administration and gateway permission tests require POSIX. HTTPS account, website and
+weekly-plan fixtures also require OpenSSL; unsupported platforms skip those cases explicitly.
 
 ## What runs
 
-`test_golden.py` runs `tools/coach.py` for four synthetic schools and compares the
-output with `golden/`. Each run gets a fresh fake home: USERPROFILE, HOME, APPDATA,
+`test_golden.py` runs `tools/coach.py` for four synthetic schools and checks exit codes,
+written artifact names, calendar boundaries, daily workload limits and Canvas requests.
+Each run gets a fresh fake home: USERPROFILE, HOME, APPDATA,
 TEMP and the archive are all inside a temp folder, with `CANVAS_TOKEN=dummy` and
 `COURSECOACH_NO_DIALOG=1`. The clock is pinned to the scenario's `now`, and every
 command gets `--date`.
@@ -49,8 +52,11 @@ ever aims at this computer (two local ports, a numeric address resolved with
   commands still work and print one note;
 - Canvas text in the collect digest and in study notes is fenced, and the HTML pages are not;
 - the page footer takes plain text only;
-- the product name appears in `tools/` only in `brand.py`, every module imports on its own,
-  and no function body is copied into two modules.
+- every module imports on its own, and no function body is copied into two modules.
+
+`test_web_auth.py` covers password and session lifecycles. Its CLI case starts with CP1252
+output streams and verifies that password provisioning succeeds; the command configures
+UTF-8 output before printing Chinese diagnostics.
 
 `test_doctor.py` checks doctor against the mock: exit 0 after a successful first
 setup and on the next run, 1 once set up but not connected, 2 when nothing can be
@@ -60,11 +66,11 @@ or a plugin's `skills/`).
 
 ## Changing behaviour on purpose
 
-The goldens were captured from the untouched package, then re-captured only where a
-fix changes output on purpose (B0: the Canvas text fence changed `01_collect_touch.txt`,
-`07_study_json.json`, `09_study_write_json.json` and `artifacts/plan.json` in each
-scenario). A refactor must leave them unchanged. If a change is meant to alter
-output, re-capture and review the diff:
+The fixtures in `golden/` provide reference exit codes, artifact names and Canvas requests.
+The scenario tests do not compare complete prose or serialized plan snapshots. When behaviour
+changes, update the affected contract assertion rather than accepting a new output dump.
+
+The harness commands below capture reference data or run one CLI command in an isolated home:
 
     python tests/harness.py capture                # from this checkout
     python tests/harness.py capture --code DIR     # from another checkout
