@@ -19,7 +19,8 @@ services:
         source: ${ACCOUNT_A_SECRET:?Set ACCOUNT_A_SECRET to account A's private service.json}
         target: /run/secrets/service.json
         read_only: true
-    networks: [outbound]
+    ports: ["127.0.0.1:${ACCOUNT_A_WEB_PORT:-18081}:8080"]
+    networks: [account_a]
 
   account_b:
     build: .
@@ -41,7 +42,9 @@ services:
         source: ${ACCOUNT_B_SECRET:?Set ACCOUNT_B_SECRET to account B's private service.json}
         target: /run/secrets/service.json
         read_only: true
-    networks: [outbound]
+    ports: ["127.0.0.1:${ACCOUNT_B_WEB_PORT:-18082}:8080"]
+    networks: [account_b]
 
 networks:
-  outbound: {}
+  account_a: {}
+  account_b: {}

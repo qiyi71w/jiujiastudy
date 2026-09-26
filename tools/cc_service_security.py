@@ -22,6 +22,28 @@ import canvas_api
 __all__ = ["ServiceSecrets", "SecureCanvas"]
 
 TELEGRAM_BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
+_MAX_CANVAS_PAGE_BYTES = 4 * 1024 * 1024
+_MAX_CANVAS_TOTAL_BYTES = 16 * 1024 * 1024
+_MAX_CANVAS_REQUEST_SECONDS = 120
+
+
+def _read_bounded_response(response, max_bytes, deadline, permit=None):
+    body = bytearray()
+    while True:
+        if permit is not None:
+            permit()
+        if time.perf_counter() >= deadline:
+            raise ValueError("Upstream response deadline exceeded")
+        block = response.read1(min(65536, max_bytes + 1 - len(body)))
+        if permit is not None:
+            permit()
+        if time.perf_counter() >= deadline:
+            raise ValueError("Upstream response deadline exceeded")
+        if not block:
+            return body
+        body.extend(block)
+        if len(body) > max_bytes:
+            raise ValueError("Upstream response exceeds size limit")
 
 
 class SecretPermissionError(PermissionError, ValueError):
@@ -66,14 +88,16 @@ class ServiceSecrets:
         # must be HTTPS, no userinfo/query/fragment/path except slash
         config_origin = self._canonical_origin(canvas_host)
 
-        # Telegram user ID in config: service.telegram_user_id positive int
         service = config.get("service")
-        user_id = None
-        if isinstance(service, dict):
-            user_id = service.get("telegram_user_id")
-
-        if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
+        if not isinstance(service, dict):
+            raise ValueError("missing service configuration")
+        user_id = service.get("telegram_user_id")
+        if user_id is not None and (not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0):
             raise ValueError("invalid service.telegram_user_id in config: must be a positive integer")
+        self.account_id = service.get("account_id")
+        if self.account_id is not None and (not isinstance(self.account_id, str) or
+                not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", self.account_id)):
+            raise ValueError("invalid service.account_id")
 
         # Open secrets file with restricted permissions (O_NOFOLLOW, regular file, no group/other access)
         if not isinstance(secrets_path, (str, bytes, os.PathLike)):
@@ -142,12 +166,14 @@ class ServiceSecrets:
             raise ValueError("invalid canvas_token in secrets: must be a non-empty string")
 
         telegram_bot_token = secret_data.get("telegram_bot_token")
-        if not isinstance(telegram_bot_token, str) or not self._is_bot_token(telegram_bot_token):
+        if telegram_bot_token is not None and not self._is_bot_token(telegram_bot_token):
             raise ValueError("invalid telegram_bot_token in secrets: must match Bot token syntax")
+        if (user_id is None) != (telegram_bot_token is None):
+            raise ValueError("Telegram user and Bot must be configured together")
 
         self.canvas_origin = config_origin
         self.canvas_token = canvas_token.strip()
-        self.telegram_bot_token = telegram_bot_token.strip()
+        self.telegram_bot_token = telegram_bot_token.strip() if telegram_bot_token else None
         ai_fields = (secret_data.get("ai_origin"), secret_data.get("ai_api_key"), secret_data.get("ai_model"))
         if any(value is not None for value in ai_fields):
             if not all(isinstance(value, str) and value.strip() for value in ai_fields):
@@ -271,8 +297,29 @@ class SecureCanvas(canvas_api.Canvas):
         self._validate_url(url)
         return url
 
-    def fetch(self, url, accept="application/json"):
+    def get(self, path, max_pages=None):
+        url = self.url_of(path)
+        items, pages, total = [], 0, 0
+        deadline = time.perf_counter() + _MAX_CANVAS_REQUEST_SECONDS
+        while url:
+            pages += 1
+            if pages > (max_pages or self.max_pages):
+                raise ValueError("Canvas pagination exceeds page limit")
+            headers, body = self.fetch(url, deadline=deadline)
+            total += len(body)
+            if total > _MAX_CANVAS_TOTAL_BYTES:
+                raise ValueError("Canvas pagination exceeds size limit")
+            payload = self._decode_payload(url, body)
+            if not isinstance(payload, list):
+                return payload
+            items.extend(payload)
+            url = self._next_link(headers)
+        return items
+
+    def fetch(self, url, accept="application/json", *, deadline=None):
         self._validate_url(url)
+        if deadline is None:
+            deadline = time.perf_counter() + _MAX_CANVAS_REQUEST_SECONDS
         headers = {
             "Accept": accept,
             "User-Agent": f"{brand.SLUG}/2 (read-only)",
@@ -284,8 +331,11 @@ class SecureCanvas(canvas_api.Canvas):
                 if self.permit is not None:
                     self.permit()
                 req = urllib.request.Request(url, headers=headers)
-                with self.opener.open(req, timeout=self.timeout) as r:
-                    return r.headers, r.read()
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise ValueError("Canvas response deadline exceeded")
+                with self.opener.open(req, timeout=min(self.timeout, 30, remaining)) as r:
+                    return r.headers, _read_bounded_response(r, _MAX_CANVAS_PAGE_BYTES, deadline, self.permit)
             except ValueError:
                 raise
             except urllib.error.HTTPError as e:
@@ -298,6 +348,9 @@ class SecureCanvas(canvas_api.Canvas):
                 if attempt == self.retries:
                     raise ValueError("Canvas API network failure") from None
                 wait = delay
+            remaining = deadline - time.perf_counter()
+            if wait >= remaining:
+                raise ValueError("Canvas response deadline exceeded")
             time.sleep(wait)
             delay *= 3
         raise ValueError("Canvas API request failed: retries exhausted") from None

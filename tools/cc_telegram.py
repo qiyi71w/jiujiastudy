@@ -361,7 +361,7 @@ class TelegramBot:
         """Signals the long polling loop to stop."""
         self._stopped = True
 
-    def run(self) -> None:
+    def run(self, *, scheduled=True) -> None:
         """Executes long polling loop against the Telegram Bot API.
 
         Verifies bot identity via getMe, verifies no active webhook via getWebhookInfo
@@ -392,10 +392,10 @@ class TelegramBot:
         # Polling and scheduled delivery use separate workers; neither blocks the other.
         with ThreadPoolExecutor(max_workers=4) as executor:
             offset: int | None = None
-            scheduled = None
+            scheduled_future = None
             while not self._stopped:
-                if scheduled is None or scheduled.done():
-                    scheduled = executor.submit(self._scheduled_once)
+                if scheduled and (scheduled_future is None or scheduled_future.done()):
+                    scheduled_future = executor.submit(self._scheduled_once)
                 payload: dict[str, Any] = {"timeout": 30, "allowed_updates": ["message", "callback_query"]}
                 if offset is not None:
                     payload["offset"] = offset

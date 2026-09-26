@@ -86,7 +86,7 @@ class SecureRefresh(unittest.TestCase):
         self.assertTrue(first["complete"], first)
         self.assertIn("ACCT1101", first["text"])
         self.assertIn("2026-03-24", first["collected_at"])
-        self.assertFalse(any(r["path"].endswith(("conversations", "modules", "files", "announcements"))
+        self.assertFalse(any(r["path"].endswith(("conversations", "files", "announcements"))
                              for r in self.server.requests()))
         self.server.requests(clear=True)
         restarted = AccountService(self.home.archive, self.secrets_path)
@@ -111,6 +111,48 @@ class SecureRefresh(unittest.TestCase):
             self.assertIn("/canvas settings", result["text"])
             self.assertEqual(2, len(result["actions"][0]))
         self.assertEqual([], self.server.requests())
+
+    def test_service_displays_configured_timezone_without_changing_schedule_or_quota(self):
+        cfg = jload(Path(self.home.archive, "config.json"))
+        cfg.update(user_tz="America/New_York", course_tz="Australia/Sydney")
+        jsave(Path(self.home.archive, "config.json"), cfg)
+        task = self.sc.course[1101]["assignments"][0]
+        task.update(name="Toronto deadline", due_at="2026-03-25T01:30:00Z",
+                    submission={"workflow_state": "unsubmitted"})
+        self.command("refresh")
+        for command in ("report", "tasks"):
+            text = self.command(command)["text"]
+            self.assertIn("2026-03-24 21:30", text)
+            self.assertIn("2026-03-24 19:00", text)
+            self.assertNotIn("2026-03-25T01:30:00Z", text)
+        with patch("cc_schedule.secrets.randbelow", return_value=0):
+            status = self.command("status")["text"]
+        self.assertIn("2026-03-24 05:00", status)
+        self.assertIn("America/New_York", status)
+        panel = self.service.ai_settings(1234)["text"]
+        self.assertIn("2026-03-23 20:00", panel)
+        self.assertIn("2026-03-24 20:00", panel)
+        saved = jload(self.service.report_path)
+        self.assertEqual("2026-03-24T09:00:00+00:00", saved["daily_plans"]["2026-03-24"]["due"])
+        self.assertEqual("UTC", saved["ai_quota_zone"])
+        task["due_at"] = "2026-03-25T02:30:00Z"
+        changed = self.command("refresh")["text"]
+        self.assertIn("2026-03-24 21:30", changed)
+        self.assertIn("2026-03-24 22:30", changed)
+        self.assertNotIn("2026-03-25T02:30:00Z", changed)
+
+    def test_ai_settings_actions_match_the_state_after_click_and_restart(self):
+        panel = self.service.ai_settings(1234)
+        enable = next(row[0] for row in panel["actions"] if row[0]["text"] == "开启 AI 主开关")
+        enabled = self.service.ai_settings(1234, enable["data"])
+        self.assertIn("主开关：开", enabled["text"])
+        disable = next(row[0] for row in enabled["actions"] if row[0]["text"] == "关闭 AI 主开关")
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        self.assertIn("AI：开启", self.command("status", restarted)["text"])
+        restarted.ai_settings(1234, enable["data"])
+        self.assertIn("AI：开启", self.command("status", restarted)["text"])
+        restarted.ai_settings(1234, disable["data"])
+        self.assertIn("AI：关闭", self.command("status", restarted)["text"])
 
     def test_binding_changes_and_unauthorized_identity_cannot_read(self):
         with self.assertRaises(ValueError):
@@ -230,7 +272,7 @@ class SecureRefresh(unittest.TestCase):
 
     def test_stopping_one_of_two_same_code_courses_keeps_other_tasks(self):
         self.sc.courses.append({"id": 1104, "name": "ACCT1101 Another section", "course_code": "ACCT1101", "_active": True})
-        self.sc.course[1104] = {"assignments": [{"id": 991, "name": "Other section task",
+        self.sc.course[1104] = {"modules": [], "assignments": [{"id": 991, "name": "Other section task",
             "due_at": "2026-03-27T10:00:00Z", "points_possible": 10,
             "submission_types": ["online_upload"], "html_url": "{{BASE}}/courses/1104/assignments/991",
             "submission": {"workflow_state": "unsubmitted"}}]}
@@ -322,7 +364,7 @@ class SecureRefresh(unittest.TestCase):
     def test_partial_refresh_updates_other_courses_and_marks_stale_data(self):
         self.sc.course[1101]["assignments"][0].update(name="Preserved old task", due_at="2026-03-27T10:00:00Z",
                                                     submission={"workflow_state": "unsubmitted"})
-        first = self.command("refresh")
+        self.command("refresh")
         pin_now("2026-03-25T01:00:00Z")
         self.server.force_status(r"/courses/1101/assignments", 403)
         self.sc.course[1102]["assignments"][0].update(name="Fresh task", due_at="2026-03-28T10:00:00Z",
@@ -332,8 +374,8 @@ class SecureRefresh(unittest.TestCase):
         self.assertIn("Fresh task", partial["text"])
         self.assertIn("Preserved old task", partial["text"])
         self.assertIn("ACCT1101", partial["text"])
-        self.assertIn(first["collected_at"], partial["text"])
-        self.assertIn("2026-03-25T01:00:00", partial["text"])
+        self.assertIn("ACCT1101，截至 2026-03-25 07:00", partial["text"])
+        self.assertIn("PSYC2012，截至 2026-03-25 09:00", partial["text"])
         restarted = AccountService(self.home.archive, self.secrets_path)
         self.assertEqual(partial, self.command("report", restarted))
         self.server.force_status(r"/courses/\d+/assignments", 403)
@@ -372,7 +414,7 @@ class SecureRefresh(unittest.TestCase):
         first = self.command("refresh")
         self.service.acknowledge_delivery(first)
         self.sc.courses.append({"id": 1104, "name": "STAT2011 Probability", "course_code": "STAT2011", "_active": True})
-        self.sc.course[1104] = {"assignments": []}
+        self.sc.course[1104] = {"assignments": [], "modules": []}
         self.server.force_status(r"/courses/\d+/assignments", 403)
         failed = self.command("refresh")
         self.assertFalse(failed["complete"])
@@ -530,9 +572,11 @@ class SecureRefresh(unittest.TestCase):
         self.command("refresh")
         self.assertEqual(1, sum(event["kind"] == "reminder" for event in
                                 jload(Path(self.home.archive, "service-report.json"))["events"]))
+        stop()
         task["submission"] = {"workflow_state": "submitted", "submitted_at": "2026-03-24T22:00:00Z"}
         self.command("refresh")
-        stop()
+        self.assertNotIn("Submission priority", self.command("tasks")["text"])
+        self.assertNotIn("Submission priority", self.service.task_list(1234, stopped=True)["text"])
         task["due_at"] = "2026-03-30T10:00:00Z"
         changed = self.command("refresh")
         self.service.acknowledge_delivery(changed)
@@ -581,6 +625,55 @@ class SecureRefresh(unittest.TestCase):
         self.assertEqual(1, len(sent), "已发出的首段可以完成；关闭后后续段不能发送")
 
 
+
+    def test_task_list_filters_submitted_and_excused_before_pagination(self):
+        sample = dict(self.sc.course[1101]["assignments"][0])
+        for course in self.sc.course.values():
+            course["assignments"] = []
+        sample.update(due_at="2026-03-27T10:00:00Z")
+        self.sc.course[1101]["assignments"] = [
+            dict(sample, id=10000 + n, name=f"Submitted {n}",
+                 submission={"workflow_state": "submitted"}) for n in range(9)] + [
+            dict(sample, id=10020, name="Excused task", submission={"excused": True}),
+            dict(sample, id=10021, name="Unknown task", submission={"workflow_state": "graded", "score": 0}),
+            dict(sample, id=10022, name="Redo task", submission={"workflow_state": "submitted", "redo_request": True})]
+        self.command("refresh")
+        self.server.requests(clear=True)
+        listing = self.command("tasks")
+        self.assertNotIn("Submitted", listing["text"])
+        self.assertNotIn("Excused task", listing["text"])
+        self.assertIn("Unknown task", listing["text"])
+        self.assertIn("Redo task", listing["text"])
+        self.assertNotIn("下一页", str(listing["actions"]))
+        self.assertEqual([], self.server.requests())
+
+    def test_report_countdown_boundaries_and_snapshot_read_time(self):
+        sample = dict(self.sc.course[1101]["assignments"][0])
+        for course in self.sc.course.values():
+            course["assignments"] = []
+        cases = [
+            ("Days", "2026-03-27T01:00:00Z", "剩余 2 天 2 小时"),
+            ("Hours", "2026-03-25T01:30:00Z", "剩余 2 小时 30 分钟"),
+            ("Minutes", "2026-03-24T23:10:00Z", "剩余 10 分钟"),
+            ("Boundary", "2026-03-24T23:00:00Z", "已到截止时间"),
+            ("Late", "2026-03-22T22:00:00Z", "逾期 2 天 1 小时"),
+            ("LateHours", "2026-03-24T21:30:00Z", "逾期 1 小时 30 分钟"),
+            ("Undated", None, "Canvas 没写日期")]
+        self.sc.course[1101]["assignments"] = [
+            dict(sample, id=10100 + n, name=name, due_at=due,
+                 submission={"workflow_state": "unsubmitted"})
+            for n, (name, due, _) in enumerate(cases)]
+        report = self.command("refresh")["text"]
+        for name, _, expected in cases:
+            row = next(line for line in report.splitlines() if f"· {name} —" in line)
+            self.assertIn(expected, row)
+        self.server.requests(clear=True)
+        pin_now("2026-03-25T02:00:00Z")
+        report = self.command("report")["text"]
+        hours = next(line for line in report.splitlines() if "· Hours —" in line)
+        self.assertIn("逾期 30 分钟", hours)
+        self.assertIn("剩余/逾期时间计算于：", report)
+        self.assertEqual([], self.server.requests())
 
     def test_telegram_task_callbacks_are_private_and_paginate(self):
         from cc_telegram import TelegramBot
@@ -836,7 +929,7 @@ class SecureRefresh(unittest.TestCase):
 
     def test_new_course_notice_only_goes_to_discovering_delivery(self):
         self.sc.courses.append({"id": 1104, "name": "STAT2011 Probability", "course_code": "STAT2011", "_active": True})
-        self.sc.course[1104] = {"assignments": []}
+        self.sc.course[1104] = {"assignments": [], "modules": []}
         with patch("cc_schedule.secrets.randbelow", return_value=0):
             self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
         manual = self.command("refresh")
@@ -847,7 +940,7 @@ class SecureRefresh(unittest.TestCase):
 
     def test_scheduled_course_notice_does_not_echo_in_manual_report(self):
         self.sc.courses.append({"id": 1104, "name": "STAT2011 Probability", "course_code": "STAT2011", "_active": True})
-        self.sc.course[1104] = {"assignments": []}
+        self.sc.course[1104] = {"assignments": [], "modules": []}
         with patch("cc_schedule.secrets.randbelow", return_value=0):
             self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
         due = self.service.scheduled_tick()
@@ -990,14 +1083,14 @@ class SecureRefresh(unittest.TestCase):
             self.service.execute(1234, "schedule", ["22:00", "UTC"], "telegram", "setting")
         first = self.service.scheduled_tick()
         self.assertIn("Stale scheduled task", first["text"])
-        stamp = self.command("report")["collected_at"]
         self.server.force_status(r"/courses/1101/assignments", 403)
         self.sc.course[1102]["assignments"][0].update(name="Updated course task",
             due_at="2026-03-27T10:00:00Z", submission={"workflow_state": "unsubmitted"})
         pin_now("2026-03-25T01:00:00Z")
         partial = self.command("refresh")
         self.assertIn("Stale scheduled task", partial["text"])
-        self.assertIn(stamp, partial["text"])
+        self.assertIn("ACCT1101，截至 2026-03-24 23:00", partial["text"])
+        self.assertIn("PSYC2012，截至 2026-03-25 01:00", partial["text"])
         self.assertIn("Updated course task", partial["text"])
 
     def test_overlapping_manual_refresh_forms_plan_without_second_collection(self):
@@ -1056,8 +1149,8 @@ class SecureRefresh(unittest.TestCase):
         self.sc.opts["max_per_page"] = 1
         entered, release = threading.Event(), threading.Event()
         original = SecureCanvas.fetch
-        def pause_after_first_page(api, url, accept="application/json"):
-            result = original(api, url, accept)
+        def pause_after_first_page(api, url, accept="application/json", **kwargs):
+            result = original(api, url, accept, **kwargs)
             if "/api/v1/courses?" in url and "&page=" not in url and not entered.is_set():
                 entered.set()
                 self.assertTrue(release.wait(5))
@@ -1138,8 +1231,8 @@ class SecureRefresh(unittest.TestCase):
         self.command("off")
         entered, release = threading.Event(), threading.Event()
         original = SecureCanvas.fetch
-        def pause(api, url, accept="application/json"):
-            result = original(api, url, accept)
+        def pause(api, url, accept="application/json", **kwargs):
+            result = original(api, url, accept, **kwargs)
             if "/api/v1/users/self" in url and not entered.is_set():
                 entered.set()
                 self.assertTrue(release.wait(5))
@@ -1222,7 +1315,7 @@ class SecureRefresh(unittest.TestCase):
             bot._execute_command(1234, "on", [], "failure")
         self.assertTrue(sent, "current failed on must reply")
 
-    def ai_endpoint(self, limit=2, answer="建议核对截止时间。", handler_hook=None, response_code=200):
+    def ai_endpoint(self, limit=2, answer="建议核对截止时间。", handler_hook=None, response_code=200, usage=None, action_factory=None, stream=False, chunk_hook=None):
         import threading
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         received = []
@@ -1237,7 +1330,32 @@ class SecureRefresh(unittest.TestCase):
                     handler.send_header("Location", "http://127.0.0.1:9/unsafe")
                     handler.end_headers()
                     return
-                data = json.dumps({"choices": [{"message": {"content": answer}}]}).encode()
+                ids = [line[6:] for line in body["messages"][1]["content"].splitlines() if line.startswith("- ID: ")]
+                content = json.dumps({"summary": answer, "announcements": [{"id": aid, "analysis": "请核对公告安排；日期待确认。", "actions": action_factory(aid, body) if action_factory else []} for aid in ids], "next_step": "先核对最近的截止事项。"}, ensure_ascii=False)
+                if stream:
+                    handler.send_response(response_code)
+                    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    handler.end_headers()
+                    def event(value):
+                        handler.wfile.write(("data: " + json.dumps(value, ensure_ascii=False) + "\r\n\r\n").encode())
+                        handler.wfile.flush()
+                    try:
+                        for index, offset in enumerate(range(0, len(content), 24)):
+                            event({"choices": [{"index": 0, "delta": {"content": content[offset:offset + 24]}, "finish_reason": None}]})
+                            if chunk_hook and chunk_hook(index) is False:
+                                return
+                        event({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+                        if usage is not None:
+                            event({"choices": [], "usage": usage})
+                        handler.wfile.write(b"data: [DONE]\r\n\r\n")
+                        handler.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass  # The consumer can revoke its permit while reading.
+                    return
+                response = {"choices": [{"message": {"content": content}}]}
+                if usage is not None:
+                    response["usage"] = usage
+                data = json.dumps(response).encode()
                 handler.send_response(response_code)
                 handler.send_header("Content-Type", "application/json")
                 handler.send_header("Content-Length", str(len(data)))
@@ -1369,7 +1487,6 @@ class SecureRefresh(unittest.TestCase):
         self.toggle_ai("AI 主开关")
         self.assertIn("AI 解读（非 Canvas 事实）", self.command("ai")["text"])
         self.service.execute(1234, "schedule", ["09:00", "America/New_York"], "telegram", "zone")
-        self.assertIn("UTC", self.command("status")["text"])
         pin_now("2026-03-25T01:00:00Z")
         self.assertIn("剩余 1/1", self.command("status")["text"])
         self.assertIn("AI 解读（非 Canvas 事实）", self.command("ai")["text"])
@@ -1411,7 +1528,7 @@ class SecureRefresh(unittest.TestCase):
         self.assertIn("下一步 怎么办？", json.dumps(received[0][2], ensure_ascii=False))
     def test_manual_ai_stops_remaining_segments_after_consent_revoked(self):
         from cc_telegram import TelegramBot
-        self.ai_endpoint(limit=1, answer="模型建议" * 1500)
+        self.ai_endpoint(limit=1, answer="模型建议" * 1200)
         self.toggle_ai("AI 主开关")
         bot = TelegramBot(self.service, self.service.secrets.telegram_bot_token)
         sent = []

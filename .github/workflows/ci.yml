@@ -26,8 +26,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
-      # Standard library only: nothing is installed. The tests talk to nothing
-      # but a mock Canvas on 127.0.0.1, and the runner refuses any other host.
+      - name: Install service dependencies
+        run: python -m pip install -r requirements.txt
+      # Tests use isolated local services and synthetic credentials.
       - name: Offline tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"

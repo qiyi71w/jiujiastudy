@@ -64,9 +64,9 @@ def ensure_plan(saved, config, now):
                 receipt = pending["delivery"].get("telegram", {})
                 if receipt.get("state") == "pending":
                     receipt["state"] = "expired"
-                pending.pop("text", None)
-        elif day < (today - dt.timedelta(days=2)).isoformat() and pending["state"] == "formed":
-            pending.pop("text", None)
+        if day < (today - dt.timedelta(days=30)).isoformat() and pending["state"] == "formed":
+            for field in ("text", "ai_text", "analysis"):
+                pending.pop(field, None)
     yesterday = (today - dt.timedelta(days=1)).isoformat()
     due_yesterday = plans.get(yesterday, {}).get("due")
     eligible = [key] if key in plans else []
