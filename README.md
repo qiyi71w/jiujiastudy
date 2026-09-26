@@ -1,12 +1,34 @@
 # 救驾
 
-给用第二语言上课的留学生的 Canvas 学习手帐：盯 deadline、排本周该学什么、按完成情况给下一步。它是一个 Agent Skill，装在你自己的电脑上，数据存在你自己的文件夹里。
+给用第二语言上课的留学生的 Canvas 学习手帐：盯 deadline、排本周该学什么、按完成情况给下一步。可以用管理员托管的网站，也可以把 Agent Skill 装在自己的电脑上。
 
 [![tests](https://github.com/jiujiastudy/jiujiastudy/actions/workflows/ci.yml/badge.svg)](https://github.com/jiujiastudy/jiujiastudy/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#要求)
 
-## 它做什么
+[网站使用](#网站使用) · [本地 Skill](#本地-skill) · [自行部署](#自行部署) · [隐私与数据](#隐私与数据) · [测试](#测试)
+
+## 网站使用
+
+打开 **[study.qiyi71w.com](https://study.qiyi71w.com)**，用管理员创建的用户名和密码登录。网站不开放自行注册；每个账号有独立的 Canvas 凭据、学习记录、扫描计划和 AI 额度。
+
+- **今日**：看今天先做的一件事、本周重点和七日安排。固定日期、第一步调整和完成记录会保留。
+- **作业**：查看截止时间、Canvas 提交状态，记录自己做完了什么，或停止某项提醒。
+- **公告**：查看最近六十天的公告、标记已读；AI 提出的行动项由你核对后加入计划。
+- **设置**：选择监控课程、扫描时间和时区，管理 AI 与 Telegram 通知授权。
+
+> [!IMPORTANT]
+> 本站的“已完成”是学习记录，不是 Canvas 提交记录。网站只读 Canvas；交作业仍要到学校网站操作。
+
+AI 需要管理员配置供应商，再由你开启。公告解读另行授权；默认不把已读公告送给模型。规则日报和周计划不依赖 AI，额度用完后仍可查看。
+
+如果账号绑定了专属 Telegram Bot，可在本人私聊中使用 `/canvas help` 查看命令，`/canvas report` 读取已有快照，`/canvas refresh` 主动采集。网站和 Bot 共用设置；关闭 Telegram 自动通知不会停掉网站的每日扫描。
+
+## 本地 Skill
+
+适合想把课件和学习资料放在自己电脑上的人。本地档案与托管网站分开，不会自动同步。
+
+### 它做什么
 
 - **Deadline 雷达**：每门课下一件要交什么、最急的一件、几件撞在一起的、Canvas 上没写日期的，一页看完。
 - **本周清单**：按模块和 deadline 排出每门课这周要看的、要做的，每天一件必做。
@@ -14,13 +36,13 @@
 - **课件在后台下**：Canvas 原件自动下到每门课的文件夹，从不让你等。
 - **发到 Canvas 之前先过你的手**：发帖、发站内信、交作业都先给预览，再弹系统窗口由你本人点确定。
 
-## 要求
+### 要求
 
-- Python 3.10 或更新（CI 在 3.10–3.14 上测过）。没有的话 AI 会先问你要不要装。
+- Python 3.10 或更新。没有的话 AI 会先问你要不要装。
 - 一个能读 Agent Skills、能跑命令的 AI 助手：Claude Code、Codex 都行。
 - Windows、macOS、Linux 都行。
 
-## 安装
+### 安装
 
 跟你的 AI 说一句（两种说法都行）：
 
@@ -34,7 +56,7 @@
 
 **装好不用重启**，直接跟 AI 说「最近要交什么」。
 
-### 手动安装
+#### 手动安装
 
 `SKILL.md` 要直接在 `skills/jiujiastudy/` 下面，不要多套一层。
 
@@ -60,7 +82,7 @@ Codex 及其它读 Agent Skills 的工具：把上面的 `.claude` 换成 `.agen
 git pull
 ```
 
-## 第一次使用
+### 第一次使用
 
 跟 AI 说「最近要交什么」，它会：
 
@@ -73,7 +95,7 @@ token 只要给一次：它存在你电脑上的 `~/.config/jiujiastudy/token`�
 
 平时这样说：「现在什么情况」「最近要交什么」「这周学什么」「做完了」「没状态」，或者直接说你想做的事：导读课件、做复习包、写东西、发帖、交作业。
 
-## 配置
+### 配置
 
 都是跟 AI 说一句它就改；想自己改，命令在下面。
 
@@ -85,23 +107,54 @@ token 只要给一次：它存在你电脑上的 `~/.config/jiujiastudy/token`�
 | 这周是学期第几周 | 按模块名推断 | 跟 AI 说「这周是第 N 周」 |
 | 资料放在哪个文件夹 | 桌面的「救驾」 | `config set root <路径>`，再让 AI 跑一次体检 |
 
-作业、截止时间、模块、公告、站内信（收件箱）总是读，这是它的本职；只读，不改 Canvas 上的任何东西。
+本地采集读取作业、截止时间、模块、公告和站内信，不修改 Canvas。发帖、发信和交作业走单独的预览与确认流程。
 
-课件文字默认不交给 AI，是因为不少学校（悉尼大学也在内）把「把课程材料放进生成式 AI」列为误用。要不要打开，由你按你那门课的规定决定。
+课件文字默认不交给 AI。打开前，请先核对这门课对课程材料和生成式 AI 的规定。
 
 ## 隐私与数据
 
 - 给人看的：桌面「救驾」文件夹——本周清单、Deadline 雷达，每门课一个文件夹（课件放 Canvas 原件，产出放 AI 做的东西）。
 - 给程序用的：同一个文件夹里的隐藏目录 `.coach`（配置、进度、采集到的原始数据）。
 - token：`~/.config/jiujiastudy/token`，只有你本人的账户能读。以前存在环境变量或钥匙串里的也认。
-- 一切都在你自己的电脑上。这个项目没有服务器，不上传任何东西。你让 AI 读的内容会经过你使用的那家 AI 服务。
-- 发帖、发站内信、交作业：先给你看预览，你说「发」，再弹一个系统确认窗口，**你本人点确定**才真的发送。窗口弹不出来就不发，把链接给你自己交。
+- 托管网站的档案和凭据保存在管理员的服务器上，管理员可以接触这些数据。绑定 Telegram 后，开启通知才会自动发送日报。
+- 交给 AI 的内容会经过所配置的供应商。托管账号复用供应商配置时共用账单，学习数据和授权仍分开。
+- 本地 Skill 发帖、发站内信、交作业：先给你看预览，你说「发」，再弹一个系统确认窗口，**你本人点确定**才真的发送。窗口弹不出来就不发，把链接给你自己交。
+
+## 自行部署
+
+账号服务使用 Linux/POSIX、Python 3.10+ 和 `requirements.txt` 中的依赖。Docker 配置见 [Dockerfile](Dockerfile) 和 [compose.yaml](compose.yaml)：每个账号运行独立容器，只挂载自己的档案和秘密文件，后台端口仅绑定宿主回环地址。
+
+统一网站的请求先经过 HTTPS 反向代理和账号网关，再进入对应后台。首次部署要准备账号配置、受限秘密文件、网页登录凭据、网关注册表和签名密钥；Compose 本身不会代办这些步骤。具体字段、权限、启动命令和维护方法见 [部署与运维参考](SERVER_PLAN.md#部署与运维参考)。
+
+已初始化统一入口的服务器可运行管理向导：
+
+```bash
+sudo tools/account-wizard.sh
+```
+
+选择新增账号、更新 Canvas Token、重设网页密码或查看状态。新增时填写学校 Canvas 网址、Token、用户名、密码和时区，可选复用已有账号的 AI 供应商；向导默认每日 AI 上限为20次，AI 授权关闭。已安装快捷命令的部署机也可用 `sudo jiujiastudy-admin`。
+
+> [!WARNING]
+> Canvas Token 和模型密钥只放在受限秘密文件中，或通过向导的隐藏输入传入。不要提交到 Git，也不要放进命令参数或日志。托管前先确认学校允许自动访问和第三方存储。
+
+## 测试
+
+在仓库根目录安装服务依赖，然后运行离线回归：
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -B -m unittest discover -s tests -v
+```
+
+测试使用临时档案、模拟 Canvas 和受控模型端点。权限场景要求 POSIX，网站与周计划的 HTTPS 场景还要求 OpenSSL；缺少前提的平台会跳过这些场景。本地 Skill 的跨平台测试继续执行。测试布局见 [tests/README.md](tests/README.md)。
+
+功能约定和部署验收记录见 [SERVER_PLAN.md](SERVER_PLAN.md)，领域用语见 [CONTEXT.md](CONTEXT.md)。离线测试不代替真实 Telegram 投递和模型供应商验收。
 
 ## 写作业这件事
 
-这个工具会帮你写草稿、讲稿、提纲、给老师的消息，也会按你的要求上传文件。**交什么、交不交，由你决定**：请自己遵守你所在学校和那门课对 AI 使用的规定，需要声明的地方自己声明。工具不会替你判断，也不会替你点提交。它不做任何「降低 AI 痕迹」之类的事。
+本地 Skill 可以帮你写草稿、讲稿、提纲和给老师的消息，也可以按确认流程上传文件。**交什么、交不交，由你决定**：请遵守每门课对 AI 使用的规定，需要声明的地方自己声明。
 
-## 卸载
+## 卸载本地 Skill
 
 1. 删掉技能文件夹（`~/.claude/skills/jiujiastudy` 或 `~/.agents/skills/jiujiastudy`）。
 2. 删掉桌面的「救驾」文件夹和 `~/.config/jiujiastudy`（Windows：`C:\Users\你的用户名\.config\jiujiastudy`）。
@@ -113,8 +166,5 @@ token 只要给一次：它存在你电脑上的 `~/.config/jiujiastudy/token`�
 
 ## 依赖
 
-只用 Python 标准库就能跑。少数功能会用到可选的第三方包（都不打包在仓库里，用到了才从 PyPI 装），清单和各自的许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+只用 Python 标准库就能运行本地 Skill；账号网站依赖 `requirements.txt`。其他可选功能按需安装第三方包，清单及许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-## 许可
-
-MIT，见 [LICENSE](LICENSE)，不提供任何担保。与 Instructure 无关，未获其背书；Canvas 是 Instructure, Inc. 的商标。使用前请自行确认它符合你所在学校的规定。

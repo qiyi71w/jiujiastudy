@@ -294,66 +294,169 @@ def pick_top(courses_out):
             "first_step": it.get("first_step"), "url": it.get("url"), "kind": it["kind"]}
 
 
-def schedule_days(ctx, today, monday, courses_out, rows):
-    """排天：deadline 前 1–2 天必做；核心课件排上课日前一天（不知道就周一到周四轮流）；其余应做 ≤2；周日收工。"""
+
+
+def schedule_days(ctx, today, monday, courses_out, rows, *, structured=False):
+    """沿用截止提前准备、分日复习及每天一件必做；结构化结果保留来源。"""
     cfg = ctx.cfg
     lead = (cfg.get("study") or {}).get("lead_days") or {"heavy": 2, "light": 1}
-    max_should = (cfg.get("study") or {}).get("max_should", 2)
+    max_should = max(0, min((cfg.get("study") or {}).get("max_should", 2), 2))
+
     days = []
     for i in range(7):
         d = monday + dt.timedelta(days=i)
-        days.append({"date": d.isoformat(), "weekday": "周一 周二 周三 周四 周五 周六 周日".split()[i], "fixed": [], "must": None,
-                     "must_first_step": None, "must_if_then": None, "must_minutes": None, "must_kind": None, "must_who": None,
-                     "must_course": None, "must_item_id": None, "must_url": None, "should": [], "revise": None, "status": "📦"})
+        days.append({
+            "date": d.isoformat(),
+            "weekday": "周一 周二 周三 周四 周五 周六 周日".split()[i],
+            "fixed": [],
+            "must": None,
+            "must_first_step": None,
+            "must_if_then": None,
+            "must_minutes": None,
+            "must_kind": None,
+            "must_who": None,
+            "must_course": None,
+            "must_item_id": None,
+            "must_url": None,
+            "should": [],
+            "revise": None,
+            "status": "📦",
+            "entries": [],
+        })
     by_date = {d["date"]: d for d in days}
     placed = set()
+    parking = []
 
-    def put_must(d, text, item, kind, who, if_then=None):
-        if item.get("id") in placed:
-            return False
-        if d["must"]:
-            if len(d["should"]) < max_should:
-                d["should"].append(text)
-                placed.add(item.get("id"))
-            return False
-        placed.add(item.get("id"))
-        d.update({"must": text, "must_first_step": item.get("first_step"), "must_minutes": item.get("minutes"), "must_kind": kind,
-                  "must_who": who, "must_course": item.get("course"), "must_item_id": item.get("id"), "must_url": item.get("url"),
-                  "must_if_then": if_then})
-        return True
+    def try_place(target_day, text, item, kind, who, if_then=None, activity="work", entry_id=None):
+        eid = entry_id or item.get("id")
+        origin_id = item.get("id")
+        if not target_day["must"]:
+            target_day.update({
+                "must": text,
+                "must_first_step": item.get("first_step"),
+                "must_minutes": item.get("minutes"),
+                "must_kind": kind,
+                "must_who": who,
+                "must_course": item.get("course"),
+                "must_item_id": item.get("id"),
+                "must_url": item.get("url"),
+                "must_if_then": if_then,
+            })
+            entry = dict(item)
+            entry["origin_id"] = origin_id
+            entry["id"] = eid
+            entry["slot"] = "must"
+            entry["activity"] = activity
+            target_day["entries"].append(entry)
+            placed.add(eid)
+            return True
+        elif len(target_day["should"]) < max_should:
+            target_day["should"].append(text)
+            entry = dict(item)
+            entry["origin_id"] = origin_id
+            entry["id"] = eid
+            entry["slot"] = "should"
+            entry["activity"] = activity
+            target_day["entries"].append(entry)
+            placed.add(eid)
+            return True
+        return False
 
-    # 1. deadline：到期前 lead 天当必做；固定时间点写进 fixed
+    def to_parking(item, text, date_str, activity="work", entry_id=None):
+        p_item = dict(item)
+        p_item["origin_id"] = item.get("id")
+        p_item["id"] = entry_id or item.get("id")
+        p_item["activity"] = activity
+        p_item["date"] = date_str
+        p_item["text"] = text
+        parking.append(p_item)
+        placed.add(p_item["id"])
+
+    # 1. deadline / overdue
     for c in courses_out:
-        for it in c["deadline_related"]:
-            if it["kind"] != "Deadline" or it.get("due_at") is None:
+        for it in c.get("deadline_related") or []:
+            it_id = it.get("id")
+            if it_id in placed:
                 continue
-            due = parse_date(ctx.clock.course_date(parse_ts(it["due_at"])).isoformat())
-            if due and due.isoformat() in by_date:
-                by_date[due.isoformat()]["fixed"].append(f"{it['when'].split(' ', 2)[-1] if it.get('when') else ''} {it['course']} {it['title']} 截止" .strip())
-            heavy = cc_state.weight_pct(it.get("weight")) >= 10
-            target = due - dt.timedelta(days=lead["heavy"] if heavy else lead["light"]) if due else None
-            if target and target < today:
-                target = today
-            if target and target.isoformat() in by_date:
-                put_must(by_date[target.isoformat()], f"{it['course']} {it['title']}（{it['when']}）", it, "自己写", "👤",
-                         "如果今天做不完，明天第一件事继续，不排别的。")
+            is_overdue = it.get("kind") == "Overdue" or bool(it.get("overdue"))
+            course = it.get("course") or c.get("code") or ""
+            if is_overdue:
+                when_str = f"（{it['when']}）" if it.get("when") else "（已过期）"
+                text = f"{course} {it.get('title') or ''}{when_str}"
+                target_date = today
+                if target_date and target_date.isoformat() in by_date:
+                    ok = try_place(by_date[target_date.isoformat()], text, it, "自己写", "👤",
+                                   "如果今天做不完，明天第一件事继续，不排别的。", activity="work")
+                    if not ok:
+                        to_parking(it, text, target_date.isoformat(), activity="work")
+                else:
+                    fallback_date = (monday + dt.timedelta(days=6)).isoformat()
+                    to_parking(it, text, fallback_date, activity="work")
+            else:
+                if it.get("kind") != "Deadline":
+                    continue
+                if it.get("due_at") is None:
+                    text = f"{course} {it.get('title') or ''}（待确认）"
+                    to_parking(it, text, (monday + dt.timedelta(days=6)).isoformat(), activity="work")
+                    continue
+                due_ts = parse_ts(it.get("due_at"))
+                due = ctx.clock.course_date(due_ts) if due_ts else None
+                if due and due.isoformat() in by_date:
+                    when_tail = it['when'].split(' ', 2)[-1] if it.get('when') else ''
+                    by_date[due.isoformat()]["fixed"].append(f"{when_tail} {course} {it.get('title') or ''} 截止".strip())
+                heavy = cc_state.weight_pct(it.get("weight")) >= 10
+                lead_days = lead["heavy"] if heavy else lead["light"]
+                target = due - dt.timedelta(days=lead_days) if due else None
+                if target and target < today:
+                    target = today
+                when_str = f"（{it['when']}）" if it.get("when") else ""
+                text = f"{course} {it.get('title') or ''}{when_str}"
+                if target and target.isoformat() in by_date:
+                    ok = try_place(by_date[target.isoformat()], text, it, "自己写", "👤",
+                                   "如果今天做不完，明天第一件事继续，不排别的。", activity="work")
+                    if not ok:
+                        to_parking(it, text, target.isoformat(), activity="work")
+                elif due and due.isoformat() in by_date:
+                    to_parking(it, text, due.isoformat(), activity="work")
+
     # 2. 考试：考前 3 天每天复习
     for c in courses_out:
-        ex = next((it for it in c["deadline_related"] if it.get("exam") and it.get("due_at")), None)
-        if not ex:
-            continue
-        due = ctx.clock.course_date(parse_ts(ex["due_at"]))
-        for k in range(1, 4):
-            d = due - dt.timedelta(days=k)
-            if d.isoformat() in by_date and d >= today:
-                w = c.get("exam") and c["exam"].get("days_left")
-                put_must(by_date[d.isoformat()], f"复习 {c['code']}：过一周的课件（{ex['title']} {ex.get('rel') or ''}）",
-                         {"first_step": "打开这门课的模块列表，从最早的一周开始，只看标题和小结页", "minutes": 60, "course": c["code"], "id": ex["id"], "url": ex.get("url")},
-                         "思考", "👤", "如果一天看不完一周，就只看每周的第一份课件。")
+        exam_cands = [it for it in (c.get("deadline_related") or []) if (it.get("exam") or it.get("kind") == "exam") and it.get("due_at")]
+        if not exam_cands and c.get("exam") and isinstance(c["exam"], dict) and c["exam"].get("due_at"):
+            ex_obj = dict(c["exam"])
+            ex_obj.setdefault("id", f"{c.get('code', 'EXAM')}-exam")
+            ex_obj.setdefault("course", c.get("code"))
+            exam_cands = [ex_obj]
+        for ex in exam_cands:
+            ex_id = ex.get("id")
+            due_ts = parse_ts(ex.get("due_at"))
+            due = ctx.clock.course_date(due_ts) if due_ts else None
+            if not due:
+                continue
+            for k in range(1, 4):
+                d = due - dt.timedelta(days=k)
+                d_str = d.isoformat()
+                if d_str in by_date and d >= today:
+                    target_day = by_date[d_str]
+                    review_id = f"{ex_id}:review:{d_str}"
+                    if review_id in placed or any(e.get("origin_id") == ex_id and e.get("activity") == "review" for e in target_day["entries"]):
+                        continue
+                    text = f"复习 {c.get('code') or ''}：过一周的课件（{ex.get('title') or ''} {ex.get('rel') or ''}）"
+                    review_item = dict(ex)
+                    review_item["first_step"] = "打开这门课的模块列表，从最早的一周开始，只看标题和小结页"
+                    review_item["minutes"] = 60
+                    review_item["minutes_src"] = "估算"
+                    review_item["course"] = c.get("code") or ex.get("course")
+                    ok = try_place(target_day, text, review_item, "思考", "👤",
+                                   "如果一天看不完一周，就只看每周的第一份课件。",
+                                   activity="review", entry_id=review_id)
+                    if not ok:
+                        to_parking(review_item, text, d_str, activity="review", entry_id=review_id)
+
     # 3. 核心课件：上课日前一天，或周一到周四轮流
     slot = 0
     for c in courses_out:
-        core = next((it for it in c["before_class"] if it["kind"] in ("File", "Page", "Video")), None)
+        core = next((it for it in (c.get("before_class") or []) if it.get("kind") in ("File", "Page", "Video")), None)
         if not core:
             continue
         if c.get("weekday"):
@@ -366,25 +469,44 @@ def schedule_days(ctx, today, monday, courses_out, rows):
         if d < today:
             d = today if today <= monday + dt.timedelta(days=6) else d
         if d.isoformat() in by_date:
-            put_must(by_date[d.isoformat()], f"{c['code']} {core['verb']}：{core['title']}（{core['minutes']} 分钟）", core, "思考", "👤",
-                     "如果看不进去，只看每页标题和最后一页小结。")
+            target_day = by_date[d.isoformat()]
+            if core.get("id") in placed:
+                continue
+            verb = core.get("verb") or "看"
+            text = f"{c.get('code') or ''} {verb}：{core.get('title') or ''}（{core['minutes']} 分钟）" if core.get("minutes") else f"{c.get('code') or ''} {verb}：{core.get('title') or ''}"
+            core_item = dict(core)
+            core_item["course"] = c.get("code") or core.get("course")
+            ok = try_place(target_day, text, core_item, "思考", "👤",
+                           "如果看不进去，只看每页标题和最后一页小结。", activity="work")
+
     # 4. 其余进应做；装不下进先搁着
-    parking = []
     for c in courses_out:
-        rest = [it for it in c["before_class"] + c["todo"] if it["id"] not in placed]
+        rest = [it for it in (c.get("before_class") or []) + (c.get("todo") or []) if it.get("id") not in placed]
         for it in rest:
-            placed.add(it["id"])
-            text = f"{c['code']} {it['verb']}：{it['title']}（{it['minutes']} 分钟）" if it.get("minutes") else f"{c['code']} {it['verb']}：{it['title']}"
+            verb = it.get("verb") or "做"
+            text = f"{c.get('code') or ''} {verb}：{it.get('title') or ''}（{it['minutes']} 分钟）" if it.get("minutes") else f"{c.get('code') or ''} {verb}：{it.get('title') or ''}"
+            it_item = dict(it)
+            it_item["course"] = c.get("code") or it.get("course")
             found_slot = False
             for d in days:
-                if parse_date(d["date"]) < today:
+                d_date = parse_date(d["date"])
+                if d_date and d_date < today:
                     continue
                 if len(d["should"]) < max_should:
                     d["should"].append(text)
+                    entry = dict(it_item)
+                    entry["origin_id"] = it.get("id")
+                    entry["id"] = it.get("id")
+                    entry["slot"] = "should"
+                    entry["activity"] = "work"
+                    d["entries"].append(entry)
+                    placed.add(it.get("id"))
                     found_slot = True
                     break
             if not found_slot:
-                parking.append({"date": (monday + dt.timedelta(days=6)).isoformat(), "text": text})
+                fallback_date = (monday + dt.timedelta(days=6)).isoformat()
+                to_parking(it_item, text, fallback_date, activity="work")
+
     for d in days:
         if not d["must"]:
             d["must"] = "整理这周的笔记，把没看完的补上" if d["weekday"] != "周日" else "收工：回我「做完了」，我来排下周"
@@ -393,8 +515,9 @@ def schedule_days(ctx, today, monday, courses_out, rows):
             d["must_first_step"] = "打开本周清单，从第一条没勾的开始"
     days[-1]["revise"] = "周日：回我「做完了」，我记进度、排下周。"
     schedule_days.parking = parking
+    if structured:
+        return {"days": days, "parking": parking}
     return days
-
 
 def last_week_review(ctx, monday):
     prev = monday - dt.timedelta(days=7)

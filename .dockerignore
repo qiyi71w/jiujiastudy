@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!tools/
+!tools/*.py
+!tools/web.js
+!requirements.txt

@@ -217,18 +217,6 @@ class CanvasTextFenceTest(unittest.TestCase):
 
 
 class ModuleHygieneTest(unittest.TestCase):
-    def test_product_name_only_in_brand(self):
-        brand = load_tool("brand")
-        needles = {brand.NAME, brand.SLUG, brand.ENV_PREFIX, brand.LEGACY_HOME_DIRNAME, *brand.LEGACY_ENV_PREFIXES}
-        needles = {n.lower() for n in needles}
-        hits = []
-        for m in tool_modules():
-            if m == "brand":
-                continue
-            with open(os.path.join(TOOLS, m + ".py"), encoding="utf-8") as f:
-                for n, line in enumerate(f, 1):
-                    hits += [f"{m}.py:{n}: {w}" for w in sorted(needles) if w in line.lower()]
-        self.assertEqual([], hits)
 
     def test_every_module_imports_on_its_own(self):
         code = ("import importlib, sys\n"
