@@ -24,6 +24,7 @@ def create_app(service, origin, *, testing=False):
         origin = ServiceSecrets._canonical_origin(origin)
     app = Flask(__name__, static_folder=None)
     app.config.update(TESTING=testing, MAX_CONTENT_LENGTH=32768)
+    upload_limit = 5 * 1024 * 1024 + 65536
     auth = WebAuth(service.home, service.account_id)
     cookie = "coach_session" if testing else "__Host-coach_session"
     js = Path(__file__).with_name("web.js").read_text(encoding="utf-8")
@@ -54,7 +55,9 @@ def create_app(service, origin, *, testing=False):
 
     @app.before_request
     def protect():
-        if request.content_length and request.content_length > 32768:
+        limit = upload_limit if request.path == "/api/syllabus" else 32768
+        request.max_content_length = limit
+        if request.content_length and request.content_length > limit:
             return failure("请求内容过大", 413)
         if request.host.lower() != urlsplit(origin).netloc.lower():
             return failure("网站地址不匹配", 400)
@@ -100,6 +103,25 @@ def create_app(service, origin, *, testing=False):
     @app.errorhandler(Exception)
     def unexpected(error):
         return failure("操作未完成，请刷新状态后重试", 503)
+
+    @app.post("/api/syllabus")
+    def syllabus():
+        credentials()
+        if request.mimetype == "application/json":
+            data = payload()
+            if set(data) - {"course_id", "url"} or not isinstance(data.get("url"), str):
+                raise ValueError("请求参数无效")
+            result = service.syllabus_import(data.get("course_id"), url=data["url"])
+        else:
+            upload = request.files.get("file")
+            if upload is None or set(request.files) != {"file"}:
+                raise ValueError("请选择大纲文件")
+            body = upload.stream.read(5 * 1024 * 1024 + 1)
+            if len(body) > 5 * 1024 * 1024:
+                raise ValueError("文件超过 5MB")
+            result = service.syllabus_import(request.form.get("course_id"), data=body,
+                name=upload.filename or "", content_type=upload.mimetype or "")
+        return jsonify(result=result, state=service.portal_state())
 
     @app.get("/")
     def index():

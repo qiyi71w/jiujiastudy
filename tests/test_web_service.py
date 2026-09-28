@@ -1,4 +1,5 @@
 """Web account contracts against isolated HTTPS Canvas and real password hashing."""
+import io
 import json
 import os
 import shutil
@@ -71,6 +72,49 @@ class Portal(unittest.TestCase):
         self.assertNotIn('fingerprint', active['daily_plans']['retired']['delivery']['telegram'])
         self.csrf = self.login()
         self.assertEqual(404, self.post('/api/syllabus/check', {}).status_code)
+
+    def test_syllabus_upload_stays_candidate_until_confirmed(self):
+        self.ai_endpoint(limit=3)
+        self.setting("ai_enabled", True)
+        self.command("refresh")
+        self.app = create_app(self.service, self.web_origin)
+        self.client = self.app.test_client()
+        self.csrf = self.login()
+        course = next(c for c in self.service.portal_state()["courses"] if c["monitored"])
+        text = "Course schedule\nMidterm exam: October 15, 2026 in class\nFinal project due Week 14\n"
+        reply = {"items": [
+            {"title": "Midterm", "kind": "exam", "date": "2026-10-15", "time": None, "date_text": "October 15",
+             "evidence": "Midterm exam: October 15, 2026"},
+            {"title": "Final project", "kind": "project", "date": None, "time": None, "date_text": "Week 14",
+             "evidence": "Final project due Week 14"}]}
+        upload = lambda: self.client.post("/api/syllabus", base_url=self.web_origin,
+            headers={"Origin": self.web_origin, "X-CSRF-Token": self.csrf},
+            data={"course_id": course["id"], "file": (io.BytesIO(text.encode()), "syllabus.txt", "text/plain")},
+            content_type="multipart/form-data")
+        self.assertEqual(403, self.client.post("/api/syllabus", base_url=self.web_origin,
+            headers={"Origin": self.web_origin}, data={"course_id": course["id"]}).status_code)
+        with patch("cc_syllabus.cc_ai._chat_json", return_value=(reply, {}, 0.1)) as model:
+            response = upload()
+            self.assertEqual(200, response.status_code, response.json)
+            self.assertIn("找到 2 项（1 项有日期）", response.json["result"]["text"])
+            again = upload()
+            self.assertIn("未重复消耗", again.json["result"]["text"])
+        self.assertEqual(1, model.call_count)
+        events = [e for e in response.json["state"]["calendar"]["events"] if e["source"] == "syllabus"]
+        self.assertEqual({"candidate"}, {e["status"] for e in events})
+        midterm = next(e for e in events if e["title"] == "Midterm")
+        self.assertEqual(("2026-10-15", "exam"), (midterm["date"], midterm["category"]))
+        confirm = {"action": "syllabus_node", "id": midterm["id"], "value": "confirm", "version": midterm["version"]}
+        self.assertEqual(200, self.post("/api/action", confirm).status_code)
+        self.assertEqual(409, self.post("/api/action", confirm).status_code)
+        state = self.service.portal_state()
+        confirmed = next(e for e in state["calendar"]["events"] if e["id"] == midterm["id"])
+        self.assertEqual("confirmed", confirmed["status"])
+        source = state["calendar"]["syllabus"]["sources"][0]
+        self.assertEqual(200, self.post("/api/action", {"action": "syllabus_source", "id": source["id"],
+            "value": "delete", "version": source["version"]}).status_code)
+        self.assertFalse([e for e in self.service.portal_state()["calendar"]["events"] if e["source"] == "syllabus"])
+        self.assertEqual(400, self.post("/api/syllabus", {"course_id": course["id"], "url": "http://127.0.0.1/s.pdf"}).status_code)
 
     def test_auth_csrf_and_password_revocation(self):
         self.assertEqual(401, self.client.get("/api/state", base_url=self.web_origin).status_code)

@@ -22,6 +22,8 @@ from cc_web_ui import WebUI
 COOKIE = "__Host-coach_gateway"
 BACKEND_COOKIE = "__Host-coach_session"
 MAX_REQUEST = 32768
+MAX_UPLOAD = 5 * 1024 * 1024 + 65536  # Only /api/syllabus; the backend re-checks the 5MB file cap.
+UPLOAD_SECONDS = 1020  # Up to 8 syllabus chunks x 120s model deadline, plus fetch time.
 MAX_RESPONSE = 2 * 1024 * 1024
 SESSION_TTL = 43200
 USERNAME = re.compile(r"[A-Za-z0-9._-]{3,64}\Z")
@@ -110,7 +112,9 @@ def create_app(registry_path, key_path, *, testing=False):
 
     @app.before_request
     def protect():
-        if request.content_length and request.content_length > MAX_REQUEST:
+        limit = MAX_UPLOAD if request.path == "/api/syllabus" else MAX_REQUEST
+        request.max_content_length = limit
+        if request.content_length and request.content_length > limit:
             return fail(413)
         try:
             registry = _registry(registry_path)
@@ -159,7 +163,8 @@ def create_app(registry_path, key_path, *, testing=False):
         return response, []
 
     def upstream(port, path, method="GET", body=None, token=None, stream=False):
-        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=65 if stream else 30)
+        connection = http.client.HTTPConnection("127.0.0.1", port,
+            timeout=65 if stream else UPLOAD_SECONDS if path == "/api/syllabus" else 30)
         headers = {"Host": request.host, "Accept": "text/event-stream" if stream else "application/json",
                    "Accept-Encoding": "identity"}
         if request.method == "POST":
@@ -283,6 +288,10 @@ def create_app(registry_path, key_path, *, testing=False):
     @app.post("/api/action")
     def action():
         return protected("/api/action", post=True)
+
+    @app.post("/api/syllabus")
+    def syllabus():
+        return protected("/api/syllabus", post=True)
 
     @app.post("/api/logout")
     def logout():

@@ -1171,6 +1171,305 @@
     return `每日 AI 额度：已用 ${quota.used} / ${quota.limit} 次，剩余 ${left} 次${reset}`;
   }
 
+  // --- 学习日历 ---
+  let calendarMonth = null;
+  const CAL_CATEGORY = {
+    assignment: { label: '作业', mark: '●' },
+    exam: { label: '考试/测验', mark: '◆' },
+    announcement: { label: '公告事项', mark: '▲' },
+    other: { label: '其他活动', mark: '■' }
+  };
+  const CAL_SOURCE = { canvas: 'Canvas', announcement: '公告', syllabus: '大纲' };
+
+  function localTodayIso(timeZone) {
+    try {
+      return new Intl.DateTimeFormat('en-CA', { timeZone: timeZone || undefined, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+    } catch (e) {
+      return new Date().toISOString().slice(0, 10);
+    }
+  }
+
+  function calendarEventMark(ev) {
+    const cat = CAL_CATEGORY[ev.category] || CAL_CATEGORY.other;
+    const mark = el('span', 'cal-mark cal-' + (CAL_CATEGORY[ev.category] ? ev.category : 'other'), cat.mark);
+    if (ev.status === 'candidate') mark.classList.add('is-candidate');
+    if (ev.status === 'done') mark.classList.add('is-done');
+    mark.setAttribute('aria-hidden', 'true');
+    return mark;
+  }
+
+  function renderCalendarCard() {
+    const cal = currentState.calendar || { events: [], syllabus: { sources: [] } };
+    const events = cal.events || [];
+    const tz = currentState.timezone;
+    const today = localTodayIso(tz);
+    if (!calendarMonth) calendarMonth = today.slice(0, 7);
+    const byDate = {};
+    const undated = [];
+    events.forEach(ev => {
+      if (ev.date) (byDate[ev.date] = byDate[ev.date] || []).push(ev);
+      else undated.push(ev);
+    });
+
+    const card = el('div', 'card section-gap calendar-card');
+    const header = el('div', 'section-header cal-header');
+    header.appendChild(el('h3', 'section-title', '学习日历'));
+    const nav = el('div', 'cal-nav');
+    const [year, month] = calendarMonth.split('-').map(Number);
+    const prev = el('button', 'btn btn-secondary btn-sm', '‹');
+    prev.type = 'button';
+    prev.setAttribute('aria-label', '上个月');
+    const next = el('button', 'btn btn-secondary btn-sm', '›');
+    next.type = 'button';
+    next.setAttribute('aria-label', '下个月');
+    const todayBtn = el('button', 'btn btn-secondary btn-sm', '本月');
+    todayBtn.type = 'button';
+    const shift = delta => {
+      const d = new Date(Date.UTC(year, month - 1 + delta, 1));
+      calendarMonth = d.toISOString().slice(0, 7);
+      renderTabToday();
+    };
+    prev.addEventListener('click', () => shift(-1));
+    next.addEventListener('click', () => shift(1));
+    todayBtn.addEventListener('click', () => { calendarMonth = today.slice(0, 7); renderTabToday(); });
+    nav.appendChild(prev);
+    nav.appendChild(el('span', 'cal-title', year + ' 年 ' + month + ' 月'));
+    nav.appendChild(next);
+    nav.appendChild(todayBtn);
+    header.appendChild(nav);
+    card.appendChild(header);
+
+    const legend = el('div', 'cal-legend');
+    Object.keys(CAL_CATEGORY).forEach(key => {
+      const item = el('span', 'cal-legend-item');
+      item.appendChild(calendarEventMark({ category: key, status: 'confirmed' }));
+      item.appendChild(document.createTextNode(CAL_CATEGORY[key].label));
+      legend.appendChild(item);
+    });
+    const candLegend = el('span', 'cal-legend-item');
+    candLegend.appendChild(calendarEventMark({ category: 'other', status: 'candidate' }));
+    candLegend.appendChild(document.createTextNode('空心 = 待你确认'));
+    legend.appendChild(candLegend);
+    card.appendChild(legend);
+
+    const grid = el('div', 'cal-grid');
+    grid.setAttribute('role', 'grid');
+    ['一', '二', '三', '四', '五', '六', '日'].forEach(d => grid.appendChild(el('div', 'cal-weekday', d)));
+    const first = new Date(Date.UTC(year, month - 1, 1));
+    const lead = (first.getUTCDay() + 6) % 7;
+    const days = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    for (let i = 0; i < lead; i++) grid.appendChild(el('div', 'cal-day is-empty'));
+    for (let day = 1; day <= days; day++) {
+      const iso = calendarMonth + '-' + String(day).padStart(2, '0');
+      const list = byDate[iso] || [];
+      const cell = el('button', 'cal-day');
+      cell.type = 'button';
+      if (iso === today) cell.classList.add('is-today');
+      if (list.length) cell.classList.add('has-events');
+      cell.appendChild(el('span', 'cal-num', String(day)));
+      if (list.some(ev => ev.needs_review)) cell.appendChild(el('span', 'cal-alert', '!'));
+      const dots = el('span', 'cal-dots');
+      const bars = el('span', 'cal-bars');
+      list.slice(0, 3).forEach(ev => {
+        const bar = el('span', 'cal-bar');
+        bar.appendChild(calendarEventMark(ev));
+        bar.appendChild(el('span', 'cal-bar-text', ev.title || ''));
+        bars.appendChild(bar);
+      });
+      if (list.length > 3) bars.appendChild(el('span', 'cal-more', '+' + (list.length - 3)));
+      list.slice(0, 4).forEach(ev => dots.appendChild(calendarEventMark(ev)));
+      cell.appendChild(bars);
+      cell.appendChild(dots);
+      cell.setAttribute('aria-label', month + '月' + day + '日，' + (list.length ? list.length + ' 项' : '无安排'));
+      cell.addEventListener('click', () => openCalendarDay(iso, list));
+      grid.appendChild(cell);
+    }
+    card.appendChild(grid);
+
+    const pending = events.filter(ev => ev.status === 'candidate').length;
+    const reviews = events.filter(ev => ev.needs_review).length;
+    const summary = el('p', 'cal-summary',
+      (pending ? pending + ' 项待确认；' : '') + (reviews ? reviews + ' 项需核对；' : '') +
+      '只有 Canvas 作业和你确认过的事项为实心。');
+    card.appendChild(summary);
+
+    if (undated.length) {
+      const box = el('details', 'cal-undated');
+      box.appendChild(el('summary', null, '日期未定（' + undated.length + '）'));
+      undated.forEach(ev => box.appendChild(renderCalendarEvent(ev)));
+      card.appendChild(box);
+    }
+    card.appendChild(renderSyllabusPanel(cal.syllabus || { sources: [] }));
+    return card;
+  }
+
+  function calendarButton(text, handler, primary) {
+    const b = el('button', 'btn btn-sm ' + (primary ? 'btn-primary' : 'btn-secondary'), text);
+    b.type = 'button';
+    b.addEventListener('click', handler);
+    return b;
+  }
+
+  function renderCalendarEvent(ev) {
+    const item = el('div', 'cal-event' + (ev.status === 'candidate' ? ' is-candidate' : '') + (ev.status === 'done' ? ' is-done' : ''));
+    const head = el('div', 'cal-event-head');
+    head.appendChild(calendarEventMark(ev));
+    head.appendChild(el('strong', 'cal-event-title', ev.title || '未命名'));
+    item.appendChild(head);
+    const meta = [ev.course || '', ev.time ? ev.time : (ev.date ? '全天' : (ev.date_text || '日期未定')),
+      '来源：' + (CAL_SOURCE[ev.source] || ev.source),
+      ev.status === 'candidate' ? '待确认' : (ev.status === 'done' ? '已完成' : '已确认')].filter(Boolean);
+    item.appendChild(el('p', 'cal-event-meta', meta.join(' · ')));
+    if (ev.evidence) item.appendChild(el('blockquote', 'cal-evidence', ev.evidence));
+    if (ev.uncertainty) item.appendChild(el('p', 'cal-event-meta', '不确定：' + ev.uncertainty));
+    if (ev.url) {
+      const origin = currentState.account && currentState.account.canvas_origin;
+      item.appendChild(isSafeCanvasUrl(ev.url, origin)
+        ? createSafeLink(ev.url, origin, '查看原文')
+        : el('p', 'cal-event-meta cal-url', '来源链接：' + ev.url));
+    }
+    const actions = el('div', 'cal-event-actions');
+    if (ev.conflict) {
+      const c = ev.conflict;
+      const warn = el('div', 'cal-conflict');
+      warn.appendChild(el('p', null, '⚠ ' + c.reason + '：公告写的是 ' + c.other_date + (c.other_time ? ' ' + c.other_time : '') +
+        '，大纲原为 ' + ev.date + (ev.time ? ' ' + ev.time : '') + '。'));
+      if (c.evidence) warn.appendChild(el('blockquote', 'cal-evidence', c.evidence));
+      item.appendChild(warn);
+      actions.appendChild(calendarButton('采用新日期', () => calendarAct(ev, 'syllabus_node', 'reschedule'), true));
+      actions.appendChild(calendarButton('保留原日期', () => calendarAct(ev, 'syllabus_node', 'keep')));
+    }
+    if (ev.source === 'syllabus') {
+      if (ev.status === 'candidate') {
+        actions.appendChild(calendarButton('加入日历', () => calendarAct(ev, 'syllabus_node', 'confirm'), true));
+        actions.appendChild(calendarButton('忽略', () => calendarAct(ev, 'syllabus_node', 'dismiss')));
+      }
+      const dateInput = el('input', 'cal-date-input');
+      dateInput.type = 'date';
+      dateInput.value = ev.date || '';
+      dateInput.setAttribute('aria-label', '修改日期');
+      const timeInput = el('input', 'cal-date-input');
+      timeInput.type = 'time';
+      timeInput.value = ev.time || '';
+      timeInput.setAttribute('aria-label', '修改时间');
+      actions.appendChild(dateInput);
+      actions.appendChild(timeInput);
+      actions.appendChild(calendarButton('改日期', () => calendarAct(ev, 'syllabus_node',
+        { operation: 'edit', date: dateInput.value || null, time: timeInput.value || null })));
+    } else if (ev.source === 'announcement' && ev.status === 'candidate') {
+      actions.appendChild(calendarButton('确认加入', () => calendarAct(ev, 'announcement_action', 'confirm'), true));
+      actions.appendChild(calendarButton('忽略', () => calendarAct(ev, 'announcement_action', 'dismiss')));
+    }
+    if (actions.childNodes.length) item.appendChild(actions);
+    return item;
+  }
+
+  async function calendarAct(ev, action, value) {
+    const dialog = document.getElementById('calendar-dialog');
+    if (dialog && dialog.open) dialog.close();
+    await sendAction({ action, id: ev.id, value, version: ev.version });
+  }
+
+  function openCalendarDay(iso, list) {
+    let dialog = document.getElementById('calendar-dialog');
+    if (!dialog) {
+      dialog = el('dialog', 'cal-dialog');
+      dialog.id = 'calendar-dialog';
+      dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+      document.body.appendChild(dialog);
+    }
+    dialog.replaceChildren();
+    const head = el('div', 'cal-dialog-head');
+    head.appendChild(el('h3', 'section-title', iso));
+    const close = calendarButton('关闭', () => dialog.close());
+    head.appendChild(close);
+    dialog.appendChild(head);
+    if (!list.length) dialog.appendChild(el('p', 'empty-state', '这一天没有安排。'));
+    list.forEach(ev => dialog.appendChild(renderCalendarEvent(ev)));
+    dialog.showModal();
+  }
+
+  function renderSyllabusPanel(syllabus) {
+    const box = el('details', 'cal-syllabus');
+    box.appendChild(el('summary', null, '导入课程大纲（考试日期）'));
+    box.appendChild(el('p', 'cal-event-meta', 'AI 会从大纲里找出考试、作业等日期，每项都要你确认后才进日历；每个片段消耗 1 次 AI 额度。扫描版 PDF 暂不支持。'));
+    const courses = (currentState.courses || []).filter(c => c.monitored && !c.inactive);
+    const form = el('form', 'cal-syllabus-form');
+    const select = el('select', 'cal-select');
+    select.setAttribute('aria-label', '课程');
+    courses.forEach(c => {
+      const o = el('option', null, c.name || c.code);
+      o.value = c.id;
+      select.appendChild(o);
+    });
+    const file = el('input');
+    file.type = 'file';
+    file.accept = '.pdf,.txt,application/pdf,text/plain';
+    file.setAttribute('aria-label', '大纲文件');
+    const link = el('input', 'cal-link-input');
+    link.type = 'url';
+    link.placeholder = '或粘贴 https 大纲链接';
+    link.setAttribute('aria-label', '大纲链接');
+    const submit = el('button', 'btn btn-primary btn-sm', '开始识别');
+    submit.type = 'submit';
+    const aiOff = !currentState.settings || !currentState.settings.ai_enabled;
+    if (aiOff || !courses.length) {
+      submit.disabled = true;
+      submit.title = aiOff ? 'AI 未在设置中启用' : '没有正在监控的课程';
+    }
+    form.appendChild(select);
+    form.appendChild(file);
+    form.appendChild(link);
+    form.appendChild(submit);
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      const chosen = file.files && file.files[0];
+      if (!chosen && !link.value.trim()) { showBanner('请选择文件或填写链接', 'warn'); return; }
+      if (chosen && chosen.size > 5 * 1024 * 1024) { showBanner('文件超过 5MB', 'error'); return; }
+      let body;
+      if (chosen) {
+        body = new FormData();
+        body.append('course_id', select.value);
+        body.append('file', chosen);
+      } else {
+        body = JSON.stringify({ course_id: select.value, url: link.value.trim() });
+      }
+      await uploadSyllabus(body);
+    });
+    box.appendChild(form);
+    (syllabus.sources || []).forEach(src => {
+      const row = el('div', 'cal-source');
+      row.appendChild(el('span', null, (src.course || '') + ' · ' + (src.name || '大纲') + ' · ' + src.nodes + ' 项'));
+      row.appendChild(calendarButton('删除', () => {
+        if (window.confirm('删除这份大纲及其所有日历条目？')) {
+          sendAction({ action: 'syllabus_source', id: src.id, value: 'delete', version: src.version });
+        }
+      }));
+      box.appendChild(row);
+    });
+    return box;
+  }
+
+  async function uploadSyllabus(body) {
+    if (isSubmitting) return;
+    const session = csrfToken;
+    setSaving(true);
+    hideBanner();
+    showToast('正在识别大纲，可能需要一分钟…');
+    try {
+      const res = await apiRequest('/api/syllabus', { method: 'POST', body });
+      if (csrfToken !== session) return;
+      if (res && res.state) currentState = res.state;
+      if (res && res.result && res.result.text) showToast(res.result.text);
+      renderAll();
+    } catch (e) {
+      if (csrfToken !== session) return;
+      if (e.status !== 409 && e.status !== 401) showBanner('导入失败：' + (e.message || '未知错误'), 'error');
+    } finally {
+      if (csrfToken === session) setSaving(false);
+    }
+  }
+
   function renderTabToday() {
     if (!elTabToday || !currentState) return;
     elTabToday.replaceChildren();
@@ -1237,6 +1536,7 @@
     actionBar.appendChild(btnAi);
     actionBar.appendChild(el('p', 'quota-note', quotaDescription(currentState.quota)));
     elTabToday.appendChild(actionBar);
+    elTabToday.appendChild(renderCalendarCard());
 
     // 3. 近期任务（由已有 tasks 筛选日期不猜事实）
     const tasksCard = el('div', 'card section-gap');
