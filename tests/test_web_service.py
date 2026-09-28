@@ -73,7 +73,7 @@ class Portal(unittest.TestCase):
         self.csrf = self.login()
         self.assertEqual(404, self.post('/api/syllabus/check', {}).status_code)
 
-    def test_syllabus_upload_stays_candidate_until_confirmed(self):
+    def test_syllabus_upload_enters_calendar_and_can_be_completed(self):
         self.ai_endpoint(limit=3)
         self.setting("ai_enabled", True)
         self.command("refresh")
@@ -96,20 +96,22 @@ class Portal(unittest.TestCase):
         with patch("cc_syllabus.cc_ai._chat_json", return_value=(reply, {}, 0.1)) as model:
             response = upload()
             self.assertEqual(200, response.status_code, response.json)
-            self.assertIn("找到 2 项（1 项有日期）", response.json["result"]["text"])
+            self.assertIn("找到 2 项（1 项有日期），已加入日历", response.json["result"]["text"])
             again = upload()
             self.assertIn("未重复消耗", again.json["result"]["text"])
         self.assertEqual(1, model.call_count)
         events = [e for e in response.json["state"]["calendar"]["events"] if e["source"] == "syllabus"]
-        self.assertEqual({"candidate"}, {e["status"] for e in events})
+        self.assertEqual({"confirmed"}, {e["status"] for e in events})
         midterm = next(e for e in events if e["title"] == "Midterm")
         self.assertEqual(("2026-10-15", "exam"), (midterm["date"], midterm["category"]))
-        confirm = {"action": "syllabus_node", "id": midterm["id"], "value": "confirm", "version": midterm["version"]}
-        self.assertEqual(200, self.post("/api/action", confirm).status_code)
-        self.assertEqual(409, self.post("/api/action", confirm).status_code)
+        complete = {"action": "syllabus_node", "id": midterm["id"], "value": "complete", "version": midterm["version"]}
+        self.assertEqual(200, self.post("/api/action", complete).status_code)
+        self.assertEqual(409, self.post("/api/action", complete).status_code)
         state = self.service.portal_state()
-        confirmed = next(e for e in state["calendar"]["events"] if e["id"] == midterm["id"])
-        self.assertEqual("confirmed", confirmed["status"])
+        done = next(e for e in state["calendar"]["events"] if e["id"] == midterm["id"])
+        self.assertEqual("done", done["status"])
+        self.assertEqual(200, self.post("/api/action", {"action": "syllabus_node", "id": midterm["id"],
+            "value": "reopen", "version": done["version"]}).status_code)
         source = state["calendar"]["syllabus"]["sources"][0]
         self.assertEqual(200, self.post("/api/action", {"action": "syllabus_source", "id": source["id"],
             "value": "delete", "version": source["version"]}).status_code)

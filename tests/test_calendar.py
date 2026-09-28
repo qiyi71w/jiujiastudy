@@ -64,14 +64,41 @@ class Projection(unittest.TestCase):
         ev = next(e for e in cc_calendar.events(saved, {"11"}, "UTC", [action()]) if e["source"] == "syllabus")
         self.assertIsNone(ev["conflict"])
 
-    def test_pending_node_and_ambiguous_matches_raise_no_conflict(self):
-        saved = saved_with({"syllabus:s:1": node(status="pending")})
-        ev = next(e for e in cc_calendar.events(saved, {"11"}, "UTC", [action()]) if e["source"] == "syllabus")
-        self.assertEqual(("candidate", None), (ev["status"], ev["conflict"]))
+    def test_ambiguous_announcement_matches_raise_no_conflict(self):
         second = {**action(), "id": "act2"}
         saved = saved_with({"syllabus:s:1": node()})
         ev = next(e for e in cc_calendar.events(saved, {"11"}, "UTC", [action(), second]) if e["source"] == "syllabus")
         self.assertIsNone(ev["conflict"])
+
+    def test_legacy_pending_node_is_shown_as_confirmed(self):
+        saved = saved_with({"syllabus:s:1": node(status="pending", title="Final exam", date="2026-12-10")})
+        ev = next(e for e in cc_calendar.events(saved, {"11"}, "UTC", []) if e["source"] == "syllabus")
+        self.assertEqual("confirmed", ev["status"])
+
+    def test_syllabus_duplicates_of_canvas_or_announcements_are_merged(self):
+        def syllabus_ids(nodes, actions=()):
+            return [e["id"] for e in cc_calendar.events(saved_with(nodes), {"11", "12"}, "UTC", list(actions))
+                    if e["source"] == "syllabus"]
+        # Same title and date as a Canvas assignment → hidden.
+        self.assertEqual([], syllabus_ids({"n": node(id="n", title="HW 1", kind="assignment", date="2026-10-02")}))
+        # Canvas wins on the exact same title even when the syllabus date differs.
+        self.assertEqual([], syllabus_ids({"n": node(id="n", title="Quiz 1", kind="quiz", date="2026-10-09")}))
+        # Title containment on the same day counts ("Midterm" inside "Midterm Exam").
+        self.assertEqual([], syllabus_ids({"n": node(id="n", title="Midterm", date="2026-10-20")}, [action()]))
+        # Another course, or an unrelated title on the same day, stays.
+        self.assertEqual(["n"], syllabus_ids({"n": node(id="n", title="HW 1", course_id="12", date="2026-10-02")}))
+        self.assertEqual(["n"], syllabus_ids({"n": node(id="n", title="Lab 1", date="2026-10-02")}))
+        # A different announced date is a date change, not a duplicate.
+        self.assertEqual(["syllabus:s:1"], syllabus_ids({"syllabus:s:1": node()}, [action()]))
+
+    def test_completed_items_are_done(self):
+        saved = saved_with({"syllabus:s:1": node(status="completed")})
+        events = cc_calendar.events(saved, {"11"}, "UTC", [action("completed", due="2026-11-01T01:00:00Z", title="Essay")],
+                                    completed_tasks={"a1": {"at": "x"}})
+        by_id = {e["id"]: e for e in events}
+        self.assertEqual(("done", None), (by_id["syllabus:s:1"]["status"], by_id["syllabus:s:1"]["conflict"]))
+        self.assertEqual("done", by_id["act1"]["status"])
+        self.assertEqual("done", by_id["canvas:a1"]["status"])
 
 
 class SyllabusGuards(unittest.TestCase):

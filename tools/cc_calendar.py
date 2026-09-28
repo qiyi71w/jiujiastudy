@@ -66,23 +66,53 @@ def events(saved, active, timezone, actions, completed_tasks=None, reminders=Non
             "uncertainty": action.get("uncertainty") or "", "version": action.get("action_version")})
     store = saved.get(SYLLABUS_KEY, {})
     announced = [a for a in actions if a.get("status") != "dismissed" and a.get("due_at")]
+    existing = [e for e in out if e["date"]]
     for node in store.get("nodes", {}).values():
         if node.get("status") == "dismissed" or node.get("course_id") not in active:
             continue
+        done = node.get("status") == "completed"
         conflict = None
-        if node.get("status") == "confirmed" and node.get("date"):
+        if not done and node.get("date"):
             conflict = _announcement_change(node, announced, zone)
+        if not conflict and _duplicate(node, existing):
+            continue
         source = store.get("sources", {}).get(node.get("source_id"), {})
         out.append({"id": node["id"], "source": "syllabus", "category": _CATEGORY.get(node.get("kind"), "other"),
             "course": node.get("course"), "course_id": node.get("course_id"), "title": node.get("title"),
             "date": node.get("date"), "time": node.get("time"),
-            "status": "candidate" if node.get("status") == "pending" else "confirmed",
+            "status": "done" if done else "confirmed",
             "needs_review": bool(conflict), "conflict": conflict,
             "url": source.get("url") or "", "source_name": source.get("name") or "",
             "evidence": node.get("evidence") or "", "date_text": node.get("date_text") or "",
             "user_edited": bool(node.get("user_edited")), "version": node_version(node)})
     out.sort(key=lambda e: (e["date"] or "9999-99-99", e["time"] or "99:99", e["course"] or "", e["id"]))
     return out
+
+
+def _same_title(a, b):
+    a, b = normalize_title(a), normalize_title(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long = sorted((a, b), key=len)
+    return len(short) >= 4 and re.search(r"\b" + re.escape(short) + r"\b", long) is not None
+
+
+def _duplicate(node, existing):
+    """A Canvas assignment or announcement item in the same course already covers this syllabus node.
+
+    Canvas with the same title wins regardless of date (Canvas is authoritative);
+    otherwise the same date plus a matching title counts as the same item.
+    """
+    for ev in existing:
+        if ev["course_id"] != node.get("course_id") or not _same_title(ev["title"], node.get("title")):
+            continue
+        if ev["date"] == node.get("date"):
+            return True
+        if ev["source"] == "canvas" and normalize_title(ev["title"]) == normalize_title(node.get("title")):
+            return True
+    return False
 
 
 def _announcement_change(node, announced, zone):

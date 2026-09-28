@@ -1271,7 +1271,7 @@
       const dots = el('span', 'cal-dots');
       const bars = el('span', 'cal-bars');
       list.slice(0, 3).forEach(ev => {
-        const bar = el('span', 'cal-bar');
+        const bar = el('span', 'cal-bar' + (ev.status === 'done' ? ' is-done' : ''));
         bar.appendChild(calendarEventMark(ev));
         bar.appendChild(el('span', 'cal-bar-text', ev.title || ''));
         bars.appendChild(bar);
@@ -1290,7 +1290,7 @@
     const reviews = events.filter(ev => ev.needs_review).length;
     const summary = el('p', 'cal-summary',
       (pending ? pending + ' 项待确认；' : '') + (reviews ? reviews + ' 项需核对；' : '') +
-      '只有 Canvas 作业和你确认过的事项为实心。');
+      '空心为公告里待你确认的事项；划线表示已完成。');
     card.appendChild(summary);
 
     if (undated.length) {
@@ -1340,10 +1340,9 @@
       actions.appendChild(calendarButton('保留原日期', () => calendarAct(ev, 'syllabus_node', 'keep')));
     }
     if (ev.source === 'syllabus') {
-      if (ev.status === 'candidate') {
-        actions.appendChild(calendarButton('加入日历', () => calendarAct(ev, 'syllabus_node', 'confirm'), true));
-        actions.appendChild(calendarButton('忽略', () => calendarAct(ev, 'syllabus_node', 'dismiss')));
-      }
+      actions.appendChild(calendarButton(ev.status === 'done' ? '恢复未完成' : '标记完成',
+        () => calendarAct(ev, 'syllabus_node', ev.status === 'done' ? 'reopen' : 'complete'), ev.status !== 'done'));
+      actions.appendChild(calendarButton('从日历移除', () => calendarAct(ev, 'syllabus_node', 'dismiss')));
       const dateInput = el('input', 'cal-date-input');
       dateInput.type = 'date';
       dateInput.value = ev.date || '';
@@ -1359,6 +1358,9 @@
     } else if (ev.source === 'announcement' && ev.status === 'candidate') {
       actions.appendChild(calendarButton('确认加入', () => calendarAct(ev, 'announcement_action', 'confirm'), true));
       actions.appendChild(calendarButton('忽略', () => calendarAct(ev, 'announcement_action', 'dismiss')));
+    } else if (ev.source === 'announcement' && !ev.needs_review) {
+      actions.appendChild(calendarButton(ev.status === 'done' ? '恢复未完成' : '标记完成',
+        () => calendarAct(ev, 'announcement_action', ev.status === 'done' ? 'reopen' : 'complete'), ev.status !== 'done'));
     }
     if (actions.childNodes.length) item.appendChild(actions);
     return item;
@@ -1407,7 +1409,7 @@
       status.setAttribute('role', syllabusStatus.kind === 'error' ? 'alert' : 'status');
       box.appendChild(status);
     }
-    box.appendChild(el('p', 'cal-event-meta', 'AI 会从大纲里找出考试、作业等日期，每项都要你确认后才进日历；每个片段消耗 1 次 AI 额度。扫描版 PDF 暂不支持。'));
+    box.appendChild(el('p', 'cal-event-meta', 'AI 会从大纲里找出考试、作业等日期并直接加入日历；和 Canvas 作业或公告里已有的同一事项会自动合并，不重复显示。每个片段消耗 1 次 AI 额度。扫描版 PDF 暂不支持。'));
     const courses = (currentState.courses || []).filter(c => c.monitored && !c.inactive);
     const form = el('form', 'cal-syllabus-form');
     const select = el('select', 'cal-select');

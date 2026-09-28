@@ -357,8 +357,9 @@ class AccountService:
         if version != cc_calendar.node_version(node):
             raise StateConflict("大纲条目已变化，请刷新后重试")
         operation = value.get("operation") if isinstance(value, dict) else value
-        if operation in ("confirm", "dismiss", "restore"):
-            node["status"] = {"confirm": "confirmed", "dismiss": "dismissed", "restore": "pending"}[operation]
+        if operation in ("confirm", "dismiss", "restore", "complete", "reopen"):
+            node["status"] = {"confirm": "confirmed", "dismiss": "dismissed", "restore": "confirmed",
+                              "complete": "completed", "reopen": "confirmed"}[operation]
         elif operation == "edit":
             if not isinstance(value, dict) or set(value) - {"operation", "date", "time"}:
                 raise ValueError("日期修改无效")
@@ -373,7 +374,7 @@ class AccountService:
         elif operation in ("reschedule", "keep"):
             announced = [a for a in action_views(saved, active) if a.get("status") != "dismissed" and a.get("due_at")]
             change = cc_calendar._announcement_change(node, announced, ZoneInfo(ctx.clock.user_name)) \
-                if node.get("status") == "confirmed" and node.get("date") else None
+                if node.get("status") in ("confirmed", "pending") and node.get("date") else None
             if not change:
                 raise StateConflict("没有待处理的日期变化，请刷新后重试")
             if operation == "reschedule":
@@ -386,7 +387,7 @@ class AccountService:
         node["revision"] = node.get("revision", 0) + 1
 
     def syllabus_import(self, course_id, data=None, name="", content_type="", url=None):
-        """Import one syllabus file or public link; every node stays a candidate until confirmed."""
+        """Import one syllabus file or link; extracted nodes enter the calendar directly (evidence-checked)."""
         ctx = self._authorized(self.account_id)
         with FileLock(os.path.join(self.home, "service-state.lock")):
             saved = self._saved()
@@ -439,10 +440,10 @@ class AccountService:
             for index, item in enumerate(items, 1):
                 node_id = f"syllabus:{source_id}:{index}"
                 store["nodes"][node_id] = {**item, "id": node_id, "source_id": source_id, "course_id": course_id,
-                                           "course": course, "status": "pending", "revision": 0}
+                                           "course": course, "status": "confirmed", "revision": 0}
             jsave(self.report_path, saved)
         dated = sum(1 for item in items if item["date"])
-        return self._result(f"从大纲找到 {len(items)} 项（{dated} 项有日期），请在日历中逐项确认。")
+        return self._result(f"从大纲找到 {len(items)} 项（{dated} 项有日期），已加入日历；和作业/公告重复的会自动合并。")
 
     def _ai_input(self, ctx, saved, snapshot, announcement_request=None):
         active = {str(cid) for cid, _ in self._monitored(ctx, saved)}

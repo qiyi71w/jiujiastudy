@@ -198,6 +198,7 @@ LOCAL_CSS = """
 .cal-assignment.is-candidate{-webkit-text-stroke-color:var(--accent)}.cal-exam.is-candidate{-webkit-text-stroke-color:var(--bad)}
 .cal-announcement.is-candidate{-webkit-text-stroke-color:var(--warn)}.cal-other.is-candidate{-webkit-text-stroke-color:var(--good)}
 .cal-mark.is-done{opacity:.4}
+.cal-bar.is-done .cal-bar-text{text-decoration:line-through;color:var(--muted)}
 .cal-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px}
 .cal-weekday{text-align:center;font-size:var(--fs-s);color:var(--muted);padding:var(--s1) 0}
 .cal-day{position:relative;min-height:84px;padding:var(--s1);border:1px solid var(--line);border-radius:var(--r-s);background:var(--surface);color:var(--ink);font:inherit;text-align:left;display:flex;flex-direction:column;gap:2px;cursor:pointer;overflow:hidden}
