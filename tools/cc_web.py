@@ -16,7 +16,6 @@ from cc_service_security import ServiceSecrets
 from cc_web_auth import WebAuth
 from cc_web_ui import WebUI
 
-
 def create_app(service, origin, *, testing=False):
     parsed = urlsplit(origin)
     if testing and parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost") and parsed.path in ("", "/"):
@@ -55,6 +54,8 @@ def create_app(service, origin, *, testing=False):
 
     @app.before_request
     def protect():
+        if request.content_length and request.content_length > 32768:
+            return failure("请求内容过大", 413)
         if request.host.lower() != urlsplit(origin).netloc.lower():
             return failure("网站地址不匹配", 400)
         if request.method == "POST":

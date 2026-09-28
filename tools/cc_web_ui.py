@@ -276,7 +276,7 @@ class WebUI:
             "    </section>\n\n"
             '    <!-- 公告 Tab -->\n'
             '    <section id="tab-announcements" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-announcements" hidden>\n'
-            "    </section>\n\n"
+            '    </section>\n\n'
             '    <!-- 设置 Tab -->\n'
             '    <section id="tab-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-settings" hidden>\n'
             "    </section>\n"

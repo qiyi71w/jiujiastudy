@@ -46,6 +46,32 @@ class Portal(unittest.TestCase):
         state = self.service.portal_state()
         return self.service.portal_action({"action": "setting", "id": key, "value": value, "version": state["settings_version"]})
 
+    def test_retired_syllabus_is_archived_and_cannot_remind(self):
+        self.command('refresh')
+        saved = self.service._saved()
+        saved['syllabus'] = {'sources': {'source': {'name': 'Original'}}, 'nodes': {'node': {'title': 'Retired exam'}}}
+        saved['events'] = [dict(id=800, kind='syllabus_reminder', syllabus_node='node', text='Retired exam',
+                                course='COURSE', at='2026-03-24T00:00:00Z', pending=['manual', 'scheduled'])]
+        saved['study_decisions'] = {'syllabus:node': {'pinned': True}, 'ordinary': {'completed': True}}
+        saved['study_weeks'] = {'2026-03-23': {'revision': 1, 'entries': {
+            'exam': {'origin_id': 'syllabus:node'}, 'ordinary': {'origin_id': 'assignment:1'}}}}
+        saved['daily_plans'] = {'retired': {'state': 'formed', 'events': [800], 'text': 'Retired exam',
+            'syllabus_pending': True, 'delivery': {'telegram': {'state': 'pending', 'fingerprint': 'old', 'progress': 1}}}}
+        jsave(self.service.report_path, saved)
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        active = restarted._saved()
+        archived = jload(os.path.join(self.home.archive, 'retired-syllabus-state.json'))
+        self.assertEqual(saved['syllabus'], archived['syllabus'])
+        self.assertEqual('Retired exam', archived['daily_plans']['retired']['text'])
+        self.assertNotIn('syllabus', active)
+        self.assertEqual([], active['events'])
+        self.assertEqual({'ordinary': {'completed': True}}, active['study_decisions'])
+        self.assertEqual({'ordinary': {'origin_id': 'assignment:1'}}, active['study_weeks']['2026-03-23']['entries'])
+        self.assertNotIn('Retired exam', active['daily_plans']['retired']['text'])
+        self.assertNotIn('fingerprint', active['daily_plans']['retired']['delivery']['telegram'])
+        self.csrf = self.login()
+        self.assertEqual(404, self.post('/api/syllabus/check', {}).status_code)
+
     def test_auth_csrf_and_password_revocation(self):
         self.assertEqual(401, self.client.get("/api/state", base_url=self.web_origin).status_code)
         self.csrf = self.login()

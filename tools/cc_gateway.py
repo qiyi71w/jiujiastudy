@@ -110,6 +110,8 @@ def create_app(registry_path, key_path, *, testing=False):
 
     @app.before_request
     def protect():
+        if request.content_length and request.content_length > MAX_REQUEST:
+            return fail(413)
         try:
             registry = _registry(registry_path)
         except (OSError, ValueError, TypeError, UnicodeError):

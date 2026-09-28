@@ -4,8 +4,9 @@ import hashlib
 import os
 import re
 import secrets
+from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 import uuid
 
 from cc_collect import refresh_courses, snapshot_from, strip_html
@@ -17,6 +18,20 @@ from cc_store import FileLock, jload, jsave
 from cc_time import parse_ts
 from cc_ai import analyze, render_analysis
 from cc_weekplan import action_views, merge_analysis, reconcile
+
+
+def _announcement_text(raw, origin):
+    class Links(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            if tag == 'a':
+                url = urljoin(origin, dict(attrs).get('href') or '')
+                if urlsplit(url).scheme == 'https' and url not in links:
+                    links.append(url)
+
+    links = []
+    Links().feed(raw or '')
+    # Preserve link-only revisions in the existing announcement version fingerprint.
+    return strip_html(raw, 16000) + ''.join('\n链接：' + url for url in links)[:4000]
 
 class StateConflict(ValueError):
     """A browser attempted to replace a newer account decision."""
@@ -129,6 +144,26 @@ class AccountService:
                         snapshot.pop("ai_announcements", None)
                 jsave(self.report_path, existing)
             saved = self._saved() or {"binding": self.binding}
+            if "syllabus" in saved:
+                # Archive the retired feature before removing its active delivery state.
+                jsave(os.path.join(self.home, "retired-syllabus-state.json"), saved)
+                saved.pop("syllabus")
+                removed = {e["id"] for e in saved.get("events", []) if e.get("syllabus_node")}
+                saved["events"] = [e for e in saved.get("events", []) if e["id"] not in removed]
+                saved["study_decisions"] = {k: v for k, v in saved.get("study_decisions", {}).items()
+                                            if not k.startswith("syllabus:")}
+                for week in saved.get("study_weeks", {}).values():
+                    week["entries"] = {k: v for k, v in week.get("entries", {}).items()
+                                       if not str(v.get("origin_id", k)).startswith("syllabus:")}
+                    week["revision"] = week.get("revision", 0) + 1
+                for plan in saved.get("daily_plans", {}).values():
+                    plan.pop("syllabus_pending", None)
+                    if removed.intersection(plan.get("events", [])):
+                        plan["events"] = [i for i in plan["events"] if i not in removed]
+                        plan["text"] = self._report(ctx, saved, [e for e in saved["events"] if e["id"] in plan["events"]])
+                        receipt = plan.get("delivery", {}).get("telegram", {})
+                        receipt.pop("fingerprint", None)
+                        receipt.pop("progress", None)
             channel_binding = [self.user_id, self.secrets.telegram_bot_token.split(":", 1)[0] if self.secrets.telegram_bot_token else None]
             if "telegram_binding" in saved and saved["telegram_binding"] != channel_binding:
                 for key in ("ai_buttons", "course_buttons", "task_buttons"):
@@ -467,6 +502,15 @@ class AccountService:
             raise
 
     def scheduled_tick(self):
+        lock = FileLock(os.path.join(self.home, "service-daily.lock"))
+        if not lock.acquire(blocking=False):
+            return None
+        try:
+            return self._scheduled_tick()
+        finally:
+            lock.release()
+
+    def _scheduled_tick(self):
         """Claim a due plan; formed reports remain deliverable without another scan."""
         ctx = self._authorized(self.account_id)
         now = ctx.clock.now_utc()
@@ -1446,7 +1490,7 @@ class AccountService:
                         if value.get("context_code") != "course_" + str(cid):
                             continue
                         aid = str(cid) + ":" + str(value["id"])
-                        text = strip_html(value.get("message"), 20000)
+                        text = _announcement_text(value.get("message"), secrets.canvas_origin)
                         title = str(value.get("title") or "未命名公告")
                         announcements.append({"id": aid, "course_id": str(cid), "course": code,
                             "title": title, "text": text, "source": value.get("html_url") or "",
