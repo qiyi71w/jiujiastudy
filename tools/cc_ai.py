@@ -57,7 +57,11 @@ def _is_valid_iso_datetime_with_tz(val: str) -> bool:
 
 _MAX_TRANSPORT = 1024 * 1024
 _MAX_CONTENT = 16000
-_MAX_REQUEST_SECONDS = 120
+# High-thinking models send no bytes until reasoning finishes (measured ~76s before the
+# first byte on a 40k-char prompt), so the per-read wait must cover the whole think phase.
+_FIRST_BYTE_SECONDS = 180
+_MAX_REQUEST_SECONDS = 300
+TIMEOUT_MESSAGE = "AI service timed out"
 
 
 class _DraftPreview:
@@ -274,10 +278,10 @@ def _read_stream(resp, permit, progress, started):
     while True:
         _check_permit(permit)
         if time.perf_counter() - started > _MAX_REQUEST_SECONDS:
-            raise ValueError("AI service network failure")
+            raise ValueError(TIMEOUT_MESSAGE)
         block = resp.read1(4096)
         if time.perf_counter() - started > _MAX_REQUEST_SECONDS:
-            raise ValueError("AI service network failure")
+            raise ValueError(TIMEOUT_MESSAGE)
         if not block:
             break
         bytes_read += len(block)
@@ -374,7 +378,7 @@ def _chat_json(url, token, model_name, system_instruction, user_prompt, permit=N
     request_started = time.perf_counter()
 
     try:
-        with opener.open(req, timeout=30) as resp:
+        with opener.open(req, timeout=_FIRST_BYTE_SECONDS) as resp:
             content_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if content_type == "text/event-stream":
                 data = _read_stream(resp, permit, progress, request_started)
@@ -394,7 +398,13 @@ def _chat_json(url, token, model_name, system_instruction, user_prompt, permit=N
         if 300 <= e.code < 400:
             raise ValueError("HTTP redirect rejected by security policy") from None
         raise ValueError(f"AI service request failed with HTTP {e.code}") from None
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except TimeoutError:
+        raise ValueError(TIMEOUT_MESSAGE) from None
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise ValueError(TIMEOUT_MESSAGE) from None
+        raise ValueError("AI service network failure") from None
+    except OSError:
         raise ValueError("AI service network failure") from None
 
     request_seconds = time.perf_counter() - request_started

@@ -328,6 +328,10 @@ def extract_nodes(endpoint, key, model, text, course, term_year, permit=None, be
         except ValueError as exc:
             if str(exc).endswith(("HTTP 401", "HTTP 403")):
                 raise ValueError("AI 服务拒绝了当前密钥（密钥无效或已过期），请管理员更新 AI 密钥") from None
+            if str(exc) == cc_ai.TIMEOUT_MESSAGE:
+                raise ValueError(f"AI 识别第 {index} 段时超时（模型思考时间过长），请稍后重试或改用思考程度较低的模型") from None
+            if str(exc) == "AI service network failure":
+                raise ValueError("连不上 AI 服务，请确认 AI 服务在线后重试") from None
             raise
         for item in validate_items(parsed, part):
             marker = (item["title"].lower(), item["date"], item["kind"])
