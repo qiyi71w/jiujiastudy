@@ -22,6 +22,7 @@ TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+import cc_ai
 from cc_ai import analyze, render_analysis
 from cc_service_security import SecureCanvas
 
@@ -664,7 +665,7 @@ class TestStructuredAI(unittest.TestCase):
         response = _FakeHTTPResponse(good)
         read = response.read1
         def slow_read(n):
-            now[0] = 121
+            now[0] = cc_ai._MAX_REQUEST_SECONDS + 1
             return read(n)
         with patch.object(response, 'read1', side_effect=slow_read), \
                 patch('time.perf_counter', side_effect=lambda: now[0]), \

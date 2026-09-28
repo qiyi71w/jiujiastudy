@@ -57,7 +57,11 @@ def _is_valid_iso_datetime_with_tz(val: str) -> bool:
 
 _MAX_TRANSPORT = 1024 * 1024
 _MAX_CONTENT = 16000
-_MAX_REQUEST_SECONDS = 120
+# High-thinking models send no bytes until reasoning finishes (measured ~76s before the
+# first byte on a 40k-char prompt), so the per-read wait must cover the whole think phase.
+_FIRST_BYTE_SECONDS = 180
+_MAX_REQUEST_SECONDS = 300
+TIMEOUT_MESSAGE = "AI service timed out"
 
 
 class _DraftPreview:
@@ -274,10 +278,10 @@ def _read_stream(resp, permit, progress, started):
     while True:
         _check_permit(permit)
         if time.perf_counter() - started > _MAX_REQUEST_SECONDS:
-            raise ValueError("AI service network failure")
+            raise ValueError(TIMEOUT_MESSAGE)
         block = resp.read1(4096)
         if time.perf_counter() - started > _MAX_REQUEST_SECONDS:
-            raise ValueError("AI service network failure")
+            raise ValueError(TIMEOUT_MESSAGE)
         if not block:
             break
         bytes_read += len(block)
@@ -311,25 +315,8 @@ def _read_stream(resp, permit, progress, started):
         raise ValueError("AI service returned malformed response")
     return {"choices": [{"message": {"content": "".join(content_parts)}}], "usage": usage}
 
-def analyze(endpoint, key, model, snapshot, question=None, announcements=None, permit=None, progress=None) -> dict:
-    """Analyze filtered course tasks via an OpenAI-compatible /v1/chat/completions API.
-
-    Parameters:
-    - endpoint: Explicit HTTPS origin string (e.g. 'https://api.openai.com').
-    - key: API authentication token.
-    - model: Name of the model to query.
-    - snapshot: Canvas snapshot dict containing course assignments, and optional as_of, timezone.
-    - question: Optional specific user inquiry.
-    - announcements: Optional list of announcements authorized by parent, each with
-      id, course, title, text, source.
-    - permit: Optional zero-arg callable to verify generation/service state.
-    - progress: Optional callback receiving requesting/streaming/validating updates;
-      streaming updates carry a human-readable draft, never a validated result.
-
-    Returns:
-    - dict: Structured analysis containing 'summary', 'announcements' (enriched with
-      course, title, source from input, and validated actions), and 'next_step'.
-    """
+def _endpoint(endpoint, key, model):
+    """Validate the configured origin, key and model; return (url, token, model_name)."""
     if not isinstance(endpoint, str) or not endpoint.strip() or "\\" in endpoint:
         raise ValueError("invalid AI endpoint")
     parsed = urllib.parse.urlsplit(endpoint.strip())
@@ -350,11 +337,151 @@ def analyze(endpoint, key, model, snapshot, question=None, announcements=None, p
 
     if not isinstance(key, str) or not key.strip() or any(c in key for c in ("\r", "\n", "\x00")):
         raise ValueError("invalid API key")
-    token = key.strip()
-
     if not isinstance(model, str) or not model.strip():
         raise ValueError("invalid AI model")
-    model_name = model.strip()
+    return url, key.strip(), model.strip()
+
+
+def _chat_json(url, token, model_name, system_instruction, user_prompt, permit=None, progress=None):
+    """Send one streamed chat request; return (parsed JSON object, raw data, request seconds)."""
+    payload = {
+        "model": model_name,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=payload_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream, application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            method="POST",
+        )
+    except ValueError:
+        raise ValueError("invalid AI request") from None
+
+    opener = urllib.request.build_opener(_StrictNoRedirectHandler())
+
+    _check_permit(permit)
+    if progress:
+        progress({"status": "requesting"})
+    request_started = time.perf_counter()
+
+    try:
+        with opener.open(req, timeout=_FIRST_BYTE_SECONDS) as resp:
+            content_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type == "text/event-stream":
+                data = _read_stream(resp, permit, progress, request_started)
+            elif content_type == "application/json":
+                raw_body = _read_bounded_response(resp, _MAX_TRANSPORT,
+                    request_started + _MAX_REQUEST_SECONDS, lambda: _check_permit(permit))
+                try:
+                    data = json.loads(raw_body.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    raise ValueError("AI service returned malformed response") from None
+            else:
+                raise ValueError("AI service returned malformed response")
+    except ValueError:
+        raise
+    except urllib.error.HTTPError as e:
+        e.close()
+        if 300 <= e.code < 400:
+            raise ValueError("HTTP redirect rejected by security policy") from None
+        raise ValueError(f"AI service request failed with HTTP {e.code}") from None
+    except TimeoutError:
+        raise ValueError(TIMEOUT_MESSAGE) from None
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise ValueError(TIMEOUT_MESSAGE) from None
+        raise ValueError("AI service network failure") from None
+    except OSError:
+        raise ValueError("AI service network failure") from None
+
+    request_seconds = time.perf_counter() - request_started
+    _check_permit(permit)
+    if progress:
+        progress({"status": "validating"})
+
+    try:
+        if not isinstance(data, dict):
+            raise ValueError("AI service returned malformed response")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("AI service returned malformed response")
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise ValueError("AI service returned malformed response")
+        msg = choice.get("message")
+        if not isinstance(msg, dict):
+            raise ValueError("AI service returned malformed response")
+        content = msg.get("content")
+        if not isinstance(content, str):
+            raise ValueError("AI service returned malformed response")
+        content = content.strip()
+        if not content:
+            raise ValueError("AI service returned empty response")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise ValueError("AI service returned malformed response") from None
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("AI service returned malformed response") from None
+
+    if len(content) > _MAX_CONTENT:
+        raise ValueError("AI service returned malformed response: content exceeds length limit")
+
+    json_text = content
+    if json_text.startswith("```"):
+        if not json_text.endswith("```") or len(json_text) < 6:
+            raise ValueError("AI service returned malformed response: invalid code fence")
+        first_newline = json_text.find("\n")
+        if first_newline == -1:
+            raise ValueError("AI service returned malformed response: invalid code fence")
+        fence_header = json_text[:first_newline].strip().lower()
+        if fence_header not in ("```json", "```"):
+            raise ValueError("AI service returned malformed response: invalid code fence format")
+        inner = json_text[first_newline + 1 : -3].strip()
+        if "```" in inner:
+            raise ValueError("AI service returned malformed response: nested code fences")
+        json_text = inner
+
+    try:
+        parsed = json.loads(json_text)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise ValueError("AI service returned malformed response: invalid JSON") from None
+    return parsed, data, request_seconds
+
+
+def analyze(endpoint, key, model, snapshot, question=None, announcements=None, permit=None, progress=None) -> dict:
+    """Analyze filtered course tasks via an OpenAI-compatible /v1/chat/completions API.
+
+    Parameters:
+    - endpoint: Explicit HTTPS origin string (e.g. 'https://api.openai.com').
+    - key: API authentication token.
+    - model: Name of the model to query.
+    - snapshot: Canvas snapshot dict containing course assignments, and optional as_of, timezone.
+    - question: Optional specific user inquiry.
+    - announcements: Optional list of announcements authorized by parent, each with
+      id, course, title, text, source.
+    - permit: Optional zero-arg callable to verify generation/service state.
+    - progress: Optional callback receiving requesting/streaming/validating updates;
+      streaming updates carry a human-readable draft, never a validated result.
+
+    Returns:
+    - dict: Structured analysis containing 'summary', 'announcements' (enriched with
+      course, title, source from input, and validated actions), and 'next_step'.
+    """
+    url, token, model_name = _endpoint(endpoint, key, model)
 
     tasks = []
     as_of = ""
@@ -492,116 +619,8 @@ def analyze(endpoint, key, model, snapshot, question=None, announcements=None, p
 
     user_prompt = "\n".join(content_parts)
 
-    payload = {
-        "model": model_name,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "messages": [
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-
-    payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-    try:
-        req = urllib.request.Request(
-            url,
-            data=payload_bytes,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream, application/json",
-                "Authorization": f"Bearer {token}",
-            },
-            method="POST",
-        )
-    except ValueError:
-        raise ValueError("invalid AI request") from None
-
-    opener = urllib.request.build_opener(_StrictNoRedirectHandler())
-
-    _check_permit(permit)
-    if progress:
-        progress({"status": "requesting"})
-    request_started = time.perf_counter()
-
-    try:
-        with opener.open(req, timeout=30) as resp:
-            content_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            if content_type == "text/event-stream":
-                data = _read_stream(resp, permit, progress, request_started)
-            elif content_type == "application/json":
-                raw_body = _read_bounded_response(resp, _MAX_TRANSPORT,
-                    request_started + _MAX_REQUEST_SECONDS, lambda: _check_permit(permit))
-                try:
-                    data = json.loads(raw_body.decode("utf-8"))
-                except (ValueError, UnicodeDecodeError):
-                    raise ValueError("AI service returned malformed response") from None
-            else:
-                raise ValueError("AI service returned malformed response")
-    except ValueError:
-        raise
-    except urllib.error.HTTPError as e:
-        e.close()
-        if 300 <= e.code < 400:
-            raise ValueError("HTTP redirect rejected by security policy") from None
-        raise ValueError(f"AI service request failed with HTTP {e.code}") from None
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise ValueError("AI service network failure") from None
-
-    request_seconds = time.perf_counter() - request_started
-    _check_permit(permit)
-    if progress:
-        progress({"status": "validating"})
-
-
-    try:
-        if not isinstance(data, dict):
-            raise ValueError("AI service returned malformed response")
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise ValueError("AI service returned malformed response")
-        choice = choices[0]
-        if not isinstance(choice, dict):
-            raise ValueError("AI service returned malformed response")
-        msg = choice.get("message")
-        if not isinstance(msg, dict):
-            raise ValueError("AI service returned malformed response")
-        content = msg.get("content")
-        if not isinstance(content, str):
-            raise ValueError("AI service returned malformed response")
-        content = content.strip()
-        if not content:
-            raise ValueError("AI service returned empty response")
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise ValueError("AI service returned malformed response") from None
-    except ValueError:
-        raise
-    except Exception:
-        raise ValueError("AI service returned malformed response") from None
-
-    if len(content) > _MAX_CONTENT:
-        raise ValueError("AI service returned malformed response: content exceeds length limit")
-
-    json_text = content
-    if json_text.startswith("```"):
-        if not json_text.endswith("```") or len(json_text) < 6:
-            raise ValueError("AI service returned malformed response: invalid code fence")
-        first_newline = json_text.find("\n")
-        if first_newline == -1:
-            raise ValueError("AI service returned malformed response: invalid code fence")
-        fence_header = json_text[:first_newline].strip().lower()
-        if fence_header not in ("```json", "```"):
-            raise ValueError("AI service returned malformed response: invalid code fence format")
-        inner = json_text[first_newline + 1 : -3].strip()
-        if "```" in inner:
-            raise ValueError("AI service returned malformed response: nested code fences")
-        json_text = inner
-
-    try:
-        parsed = json.loads(json_text)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise ValueError("AI service returned malformed response: invalid JSON") from None
+    parsed, data, request_seconds = _chat_json(url, token, model_name, system_instruction, user_prompt,
+                                               permit, progress)
 
     if not isinstance(parsed, dict):
         raise ValueError("AI service returned malformed response: expected JSON object")

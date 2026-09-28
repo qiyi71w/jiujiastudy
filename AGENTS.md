@@ -8,3 +8,17 @@
 - 规矩：每句结论带出处；只在用户来问或来不及时开口；每次交付末尾一句状态和建议；待确认只问一次。
 - 两个地方：资料夹（默认桌面的「救驾」，`paths` 打印路径；每门课一个文件夹，「课件」放 Canvas 原件，「产出」放 AI 做的一切；根目录是 本周清单.html 和 Deadline雷达.html）和机器档案（config.json、state.json、raw/、plans/，在资料夹的 .coach 或老版档案 ~/CourseCoach）。config.json 是唯一事实源，没有任何学校的默认值。
 - 主次：先出准确的 deadline 和本周清单；课件排队后台补（`collect --download --background`），从不让用户等。
+
+## Agent skills
+
+### Issue tracker
+
+任务单与规格使用 `.scratch/<feature>/` 下的本地 Markdown；创建、读取或更新任务前，阅读 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+使用五个默认 triage 标签；分类任务或更新分类状态前，阅读 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+采用 single-context：根目录 `CONTEXT.md` 与 `docs/adr/`；探索代码或提出领域变更前，阅读 `docs/agents/domain.md`。

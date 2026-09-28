@@ -4,8 +4,9 @@ import hashlib
 import os
 import re
 import secrets
+from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 import uuid
 
 from cc_collect import refresh_courses, snapshot_from, strip_html
@@ -17,6 +18,22 @@ from cc_store import FileLock, jload, jsave
 from cc_time import parse_ts
 from cc_ai import analyze, render_analysis
 from cc_weekplan import action_views, merge_analysis, reconcile
+import cc_calendar
+import cc_syllabus
+
+
+def _announcement_text(raw, origin):
+    class Links(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            if tag == 'a':
+                url = urljoin(origin, dict(attrs).get('href') or '')
+                if urlsplit(url).scheme == 'https' and url not in links:
+                    links.append(url)
+
+    links = []
+    Links().feed(raw or '')
+    # Preserve link-only revisions in the existing announcement version fingerprint.
+    return strip_html(raw, 16000) + ''.join('\n链接：' + url for url in links)[:4000]
 
 class StateConflict(ValueError):
     """A browser attempted to replace a newer account decision."""
@@ -129,6 +146,26 @@ class AccountService:
                         snapshot.pop("ai_announcements", None)
                 jsave(self.report_path, existing)
             saved = self._saved() or {"binding": self.binding}
+            if "syllabus" in saved:
+                # Archive the retired feature before removing its active delivery state.
+                jsave(os.path.join(self.home, "retired-syllabus-state.json"), saved)
+                saved.pop("syllabus")
+                removed = {e["id"] for e in saved.get("events", []) if e.get("syllabus_node")}
+                saved["events"] = [e for e in saved.get("events", []) if e["id"] not in removed]
+                saved["study_decisions"] = {k: v for k, v in saved.get("study_decisions", {}).items()
+                                            if not k.startswith("syllabus:")}
+                for week in saved.get("study_weeks", {}).values():
+                    week["entries"] = {k: v for k, v in week.get("entries", {}).items()
+                                       if not str(v.get("origin_id", k)).startswith("syllabus:")}
+                    week["revision"] = week.get("revision", 0) + 1
+                for plan in saved.get("daily_plans", {}).values():
+                    plan.pop("syllabus_pending", None)
+                    if removed.intersection(plan.get("events", [])):
+                        plan["events"] = [i for i in plan["events"] if i not in removed]
+                        plan["text"] = self._report(ctx, saved, [e for e in saved["events"] if e["id"] in plan["events"]])
+                        receipt = plan.get("delivery", {}).get("telegram", {})
+                        receipt.pop("fingerprint", None)
+                        receipt.pop("progress", None)
             channel_binding = [self.user_id, self.secrets.telegram_bot_token.split(":", 1)[0] if self.secrets.telegram_bot_token else None]
             if "telegram_binding" in saved and saved["telegram_binding"] != channel_binding:
                 for key in ("ai_buttons", "course_buttons", "task_buttons"):
@@ -288,6 +325,125 @@ class AccountService:
         saved = self._saved() or {}
         if saved.get("ai_revision", 0) != revision or not saved.get("ai", {}).get("enabled"):
             raise _StaleOperation()
+
+    def _calendar_state(self, ctx, saved, active):
+        actions = action_views(saved, active)
+        store = saved.get(cc_calendar.SYLLABUS_KEY, {})
+        sources = [{"id": sid, "course_id": s["course_id"], "course": s.get("course"), "name": s.get("name"),
+                    "url": s.get("url") or "", "imported_at": s.get("imported_at"),
+                    "nodes": sum(1 for n in store.get("nodes", {}).values() if n.get("source_id") == sid),
+                    "version": s.get("revision", 0)}
+                   for sid, s in store.get("sources", {}).items() if s.get("course_id") in active]
+        sources.sort(key=lambda s: (s["course"] or "", s["imported_at"] or ""))
+        return {"events": cc_calendar.events(saved, active, ctx.clock.user_name, actions,
+                                             saved.get("completed_tasks", {}), saved.get("reminders", {})),
+                "syllabus": {"sources": sources}}
+
+    def _syllabus_change(self, ctx, saved, action, ident, value, version):
+        store = cc_calendar.syllabus_store(saved)
+        active = {str(cid) for cid, _ in self._monitored(ctx, saved)}
+        if action == "syllabus_source":
+            source = store["sources"].get(ident)
+            if not source or source.get("course_id") not in active or value != "delete":
+                raise ValueError("大纲操作无效")
+            if version != source.get("revision", 0):
+                raise StateConflict("大纲已变化，请刷新后重试")
+            store["sources"].pop(ident)
+            store["nodes"] = {k: n for k, n in store["nodes"].items() if n.get("source_id") != ident}
+            return
+        node = store["nodes"].get(ident)
+        if not node or node.get("course_id") not in active:
+            raise ValueError("大纲条目不存在")
+        if version != cc_calendar.node_version(node):
+            raise StateConflict("大纲条目已变化，请刷新后重试")
+        operation = value.get("operation") if isinstance(value, dict) else value
+        if operation in ("confirm", "dismiss", "restore", "complete", "reopen"):
+            node["status"] = {"confirm": "confirmed", "dismiss": "dismissed", "restore": "confirmed",
+                              "complete": "completed", "reopen": "confirmed"}[operation]
+        elif operation == "edit":
+            if not isinstance(value, dict) or set(value) - {"operation", "date", "time"}:
+                raise ValueError("日期修改无效")
+            try:
+                date = dt.date.fromisoformat(value.get("date")).isoformat() if value.get("date") else None
+            except (TypeError, ValueError):
+                raise ValueError("请选择有效日期") from None
+            clock = value.get("time") or None
+            if clock is not None and (not isinstance(clock, str) or not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", clock)):
+                raise ValueError("请填写有效时间")
+            node.update(date=date, time=clock if date else None, user_edited=True)
+        elif operation in ("reschedule", "keep"):
+            announced = [a for a in action_views(saved, active) if a.get("status") != "dismissed" and a.get("due_at")]
+            change = cc_calendar._announcement_change(node, announced, ZoneInfo(ctx.clock.user_name)) \
+                if node.get("status") in ("confirmed", "pending") and node.get("date") else None
+            if not change:
+                raise StateConflict("没有待处理的日期变化，请刷新后重试")
+            if operation == "reschedule":
+                node.update(date=change["other_date"], time=change["other_time"], user_edited=True,
+                            rescheduled_by=change["action_id"])
+            node.setdefault("kept", []).append([change["action_id"], change["due_at"]])
+            node["kept"] = node["kept"][-20:]
+        else:
+            raise ValueError("大纲条目操作无效")
+        node["revision"] = node.get("revision", 0) + 1
+
+    def syllabus_import(self, course_id, data=None, name="", content_type="", url=None):
+        """Import one syllabus file or link; extracted nodes enter the calendar directly (evidence-checked)."""
+        ctx = self._authorized(self.account_id)
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            saved = self._saved()
+            active = {str(cid): code for cid, code in self._monitored(ctx, saved)}
+            if not isinstance(course_id, str) or course_id not in active:
+                raise ValueError("请选择正在监控的课程")
+            ai, _, used, available = self._ai_state(ctx, saved)
+            reason = self._ai_unavailable(ai, used, available, self.secrets.ai_daily_limit)
+            if reason:
+                raise ValueError(reason)
+            generation = saved.get("service_generation", 0)
+            revision = saved.get("ai_revision", 0)
+        if url is not None:
+            target = cc_syllabus.canvas_target(url, self.secrets.canvas_origin)
+            if target:
+                if target[1] != course_id:
+                    raise ValueError("链接属于另一门课，请在下拉框里选对应的课程")
+                api = SecureCanvas(self.secrets.canvas_origin, self.secrets.canvas_token,
+                                   permit=lambda: self._require(generation))
+                data, content_type, name = cc_syllabus.canvas_fetch(api, target, permit=lambda: self._require(generation))
+            else:
+                data, content_type, url = cc_syllabus.fetch(url, permit=lambda: self._require(generation))
+                name = urlsplit(url).path.rsplit("/", 1)[-1] or urlsplit(url).hostname
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise ValueError("请选择大纲文件")
+        text = cc_syllabus.extract_text(bytes(data), content_type, name)
+        source_id = cc_syllabus.digest(f"{course_id}\n{text}".encode("utf-8"))[:16]
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            if source_id in (self._saved() or {}).get(cc_calendar.SYLLABUS_KEY, {}).get("sources", {}):
+                return self._result("这份大纲已导入，未重复消耗 AI 额度。")
+
+        def reserve():
+            reason = self._reserve_ai(ctx, generation)
+            if reason:
+                raise ValueError(reason)
+        try:
+            items = cc_syllabus.extract_nodes(self.secrets.ai_origin, self.secrets.ai_api_key, self.secrets.ai_model,
+                text, active[course_id], ctx.clock.now_utc().year,
+                permit=lambda: self._require_ai(generation, revision), before_chunk=reserve)
+        except _StaleOperation:
+            raise ValueError("服务或 AI 设置已变化，请重试") from None
+        with FileLock(os.path.join(self.home, "service-state.lock")):
+            self._require(generation)
+            saved = self._saved()
+            store = cc_calendar.syllabus_store(saved)
+            course = next((c.get("name") or c["code"] for c in ctx.cfg.get("courses", []) if str(c["id"]) == course_id),
+                          active[course_id])
+            store["sources"][source_id] = {"course_id": course_id, "course": course, "name": str(name)[:120],
+                "url": url or "", "imported_at": ctx.clock.now_utc().isoformat(), "revision": 0}
+            for index, item in enumerate(items, 1):
+                node_id = f"syllabus:{source_id}:{index}"
+                store["nodes"][node_id] = {**item, "id": node_id, "source_id": source_id, "course_id": course_id,
+                                           "course": course, "status": "confirmed", "revision": 0}
+            jsave(self.report_path, saved)
+        dated = sum(1 for item in items if item["date"])
+        return self._result(f"从大纲找到 {len(items)} 项（{dated} 项有日期），已加入日历；和作业/公告重复的会自动合并。")
 
     def _ai_input(self, ctx, saved, snapshot, announcement_request=None):
         active = {str(cid) for cid, _ in self._monitored(ctx, saved)}
@@ -467,6 +623,15 @@ class AccountService:
             raise
 
     def scheduled_tick(self):
+        lock = FileLock(os.path.join(self.home, "service-daily.lock"))
+        if not lock.acquire(blocking=False):
+            return None
+        try:
+            return self._scheduled_tick()
+        finally:
+            lock.release()
+
+    def _scheduled_tick(self):
         """Claim a due plan; formed reports remain deliverable without another scan."""
         ctx = self._authorized(self.account_id)
         now = ctx.clock.now_utc()
@@ -930,6 +1095,7 @@ class AccountService:
                         "period": "day", "timezone": quota_zone, "period_start": quota_start.isoformat(), "reset_at": quota_reset.isoformat()},
                     "tasks": tasks, "courses": courses, "announcements": announcements,
                     "weekly_plan": weekly,
+                    "calendar": self._calendar_state(ctx, saved, active),
                     "announcement_range": snapshot.get("announcement_range", {"start": None, "end": None, "complete": False}),
                     "analysis": analysis,
                     "history": history}
@@ -1062,6 +1228,8 @@ class AccountService:
                 saved.setdefault("course_buttons", {})[token] = {"cid": ident, "stopped": stopped,
                     "inactive": bool(course.get("inactive")), "at": dt.datetime.now(dt.timezone.utc).timestamp()}
                 course_token = "course:" + token
+            elif action in ("syllabus_node", "syllabus_source"):
+                self._syllabus_change(ctx, saved, action, ident, value, body.get("version"))
             else:
                 raise ValueError("不支持的操作")
             jsave(self.report_path, saved)
@@ -1446,7 +1614,7 @@ class AccountService:
                         if value.get("context_code") != "course_" + str(cid):
                             continue
                         aid = str(cid) + ":" + str(value["id"])
-                        text = strip_html(value.get("message"), 20000)
+                        text = _announcement_text(value.get("message"), secrets.canvas_origin)
                         title = str(value.get("title") or "未命名公告")
                         announcements.append({"id": aid, "course_id": str(cid), "course": code,
                             "title": title, "text": text, "source": value.get("html_url") or "",

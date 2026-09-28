@@ -31,7 +31,7 @@ def main(argv=None):
         from cc_web import create_app
         server = create_server(create_app(service, origin), host=args.listen, port=args.port,
                                threads=8, connection_limit=64, channel_timeout=180,
-                               max_request_body_size=32768, clear_untrusted_proxy_headers=True)
+                               max_request_body_size=5 * 1024 * 1024 + 65536, clear_untrusted_proxy_headers=True)
     elif not bot:
         raise ValueError("需要配置网站地址或 Telegram")
 

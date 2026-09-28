@@ -167,8 +167,8 @@ def reconcile(ctx, saved, active):
     for item in scheduled['parking']:
         proposals.setdefault(item['id'], {**item, 'date': None, 'slot': 'should', 'activity': item.get('activity', 'work')})
     # Undated facts remain visible for confirmation, not silently assigned a deadline.
-    pending = [item for item in all_items.values() if not item.get('due_at') and item['kind'] == 'Deadline'
-               and not item['completed'] and not item.get('stopped')]
+    pending = [item for item in all_items.values() if not item.get('due_at')
+               and item['kind'] == 'Deadline' and not item['completed'] and not item.get('stopped')]
     before = copy.deepcopy(week['entries'])
     for key, old in before.items():
         base = all_items.get(old.get('origin_id', key))
@@ -193,9 +193,14 @@ def reconcile(ctx, saved, active):
         if pinned:
             date = decision['date']
         step = decision.get('first_step', proposal.get('first_step'))
+        needs_review = bool(base.get('needs_review') or (old and old.get('needs_review')) or (pinned and old and not same_fact))
         entry = {**base, **proposal, 'origin_id': origin, 'date': date, 'first_step': step,
                  'pinned': pinned, 'completed': bool(base['completed'] or proposal.get('completed')),
-                 'fact_version': base.get('fact_version')}
+                 'fact_version': base.get('fact_version'), 'needs_review': needs_review}
+        if pinned and old and not same_fact:
+            for k in ('title', 'when', 'due_at', 'days_left', 'weight', 'exam', 'uncertainty'):
+                if k in base:
+                    entry[k] = base[k]
         entries[key] = entry
     # Retain checked items in their original frame instead of recreating them tomorrow.
     for key, old in before.items():

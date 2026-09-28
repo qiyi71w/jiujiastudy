@@ -1,4 +1,5 @@
 """Web account contracts against isolated HTTPS Canvas and real password hashing."""
+import io
 import json
 import os
 import shutil
@@ -45,6 +46,77 @@ class Portal(unittest.TestCase):
     def setting(self, key, value):
         state = self.service.portal_state()
         return self.service.portal_action({"action": "setting", "id": key, "value": value, "version": state["settings_version"]})
+
+    def test_retired_syllabus_is_archived_and_cannot_remind(self):
+        self.command('refresh')
+        saved = self.service._saved()
+        saved['syllabus'] = {'sources': {'source': {'name': 'Original'}}, 'nodes': {'node': {'title': 'Retired exam'}}}
+        saved['events'] = [dict(id=800, kind='syllabus_reminder', syllabus_node='node', text='Retired exam',
+                                course='COURSE', at='2026-03-24T00:00:00Z', pending=['manual', 'scheduled'])]
+        saved['study_decisions'] = {'syllabus:node': {'pinned': True}, 'ordinary': {'completed': True}}
+        saved['study_weeks'] = {'2026-03-23': {'revision': 1, 'entries': {
+            'exam': {'origin_id': 'syllabus:node'}, 'ordinary': {'origin_id': 'assignment:1'}}}}
+        saved['daily_plans'] = {'retired': {'state': 'formed', 'events': [800], 'text': 'Retired exam',
+            'syllabus_pending': True, 'delivery': {'telegram': {'state': 'pending', 'fingerprint': 'old', 'progress': 1}}}}
+        jsave(self.service.report_path, saved)
+        restarted = AccountService(self.home.archive, self.secrets_path)
+        active = restarted._saved()
+        archived = jload(os.path.join(self.home.archive, 'retired-syllabus-state.json'))
+        self.assertEqual(saved['syllabus'], archived['syllabus'])
+        self.assertEqual('Retired exam', archived['daily_plans']['retired']['text'])
+        self.assertNotIn('syllabus', active)
+        self.assertEqual([], active['events'])
+        self.assertEqual({'ordinary': {'completed': True}}, active['study_decisions'])
+        self.assertEqual({'ordinary': {'origin_id': 'assignment:1'}}, active['study_weeks']['2026-03-23']['entries'])
+        self.assertNotIn('Retired exam', active['daily_plans']['retired']['text'])
+        self.assertNotIn('fingerprint', active['daily_plans']['retired']['delivery']['telegram'])
+        self.csrf = self.login()
+        self.assertEqual(404, self.post('/api/syllabus/check', {}).status_code)
+
+    def test_syllabus_upload_enters_calendar_and_can_be_completed(self):
+        self.ai_endpoint(limit=3)
+        self.setting("ai_enabled", True)
+        self.command("refresh")
+        self.app = create_app(self.service, self.web_origin)
+        self.client = self.app.test_client()
+        self.csrf = self.login()
+        course = next(c for c in self.service.portal_state()["courses"] if c["monitored"])
+        text = "Course schedule\nMidterm exam: October 15, 2026 in class\nFinal project due Week 14\n"
+        reply = {"items": [
+            {"title": "Midterm", "kind": "exam", "date": "2026-10-15", "time": None, "date_text": "October 15",
+             "evidence": "Midterm exam: October 15, 2026"},
+            {"title": "Final project", "kind": "project", "date": None, "time": None, "date_text": "Week 14",
+             "evidence": "Final project due Week 14"}]}
+        upload = lambda: self.client.post("/api/syllabus", base_url=self.web_origin,
+            headers={"Origin": self.web_origin, "X-CSRF-Token": self.csrf},
+            data={"course_id": course["id"], "file": (io.BytesIO(text.encode()), "syllabus.txt", "text/plain")},
+            content_type="multipart/form-data")
+        self.assertEqual(403, self.client.post("/api/syllabus", base_url=self.web_origin,
+            headers={"Origin": self.web_origin}, data={"course_id": course["id"]}).status_code)
+        with patch("cc_syllabus.cc_ai._chat_json", return_value=(reply, {}, 0.1)) as model:
+            response = upload()
+            self.assertEqual(200, response.status_code, response.json)
+            self.assertIn("找到 2 项（1 项有日期），已加入日历", response.json["result"]["text"])
+            again = upload()
+            self.assertIn("未重复消耗", again.json["result"]["text"])
+        self.assertEqual(1, model.call_count)
+        events = [e for e in response.json["state"]["calendar"]["events"] if e["source"] == "syllabus"]
+        self.assertEqual({"confirmed"}, {e["status"] for e in events})
+        midterm = next(e for e in events if e["title"] == "Midterm")
+        self.assertEqual(("2026-10-15", "exam"), (midterm["date"], midterm["category"]))
+        complete = {"action": "syllabus_node", "id": midterm["id"], "value": "complete", "version": midterm["version"]}
+        self.assertEqual(200, self.post("/api/action", complete).status_code)
+        self.assertEqual(409, self.post("/api/action", complete).status_code)
+        state = self.service.portal_state()
+        done = next(e for e in state["calendar"]["events"] if e["id"] == midterm["id"])
+        self.assertEqual("done", done["status"])
+        self.assertEqual(200, self.post("/api/action", {"action": "syllabus_node", "id": midterm["id"],
+            "value": "reopen", "version": done["version"]}).status_code)
+        source = state["calendar"]["syllabus"]["sources"][0]
+        self.assertEqual(200, self.post("/api/action", {"action": "syllabus_source", "id": source["id"],
+            "value": "delete", "version": source["version"]}).status_code)
+        self.assertFalse([e for e in self.service.portal_state()["calendar"]["events"] if e["source"] == "syllabus"])
+        self.assertEqual(400, self.post("/api/syllabus", {"course_id": course["id"], "url": "http://127.0.0.1/s.pdf"}).status_code)
 
     def test_auth_csrf_and_password_revocation(self):
         self.assertEqual(401, self.client.get("/api/state", base_url=self.web_origin).status_code)

@@ -395,14 +395,14 @@ def schedule_days(ctx, today, monday, courses_out, rows, *, structured=False):
             else:
                 if it.get("kind") != "Deadline":
                     continue
-                if it.get("due_at") is None:
+                due_ts = parse_ts(it.get("due_at"))
+                due = ctx.clock.course_date(due_ts) if due_ts else None
+                if due is None:
                     text = f"{course} {it.get('title') or ''}（待确认）"
                     to_parking(it, text, (monday + dt.timedelta(days=6)).isoformat(), activity="work")
                     continue
-                due_ts = parse_ts(it.get("due_at"))
-                due = ctx.clock.course_date(due_ts) if due_ts else None
                 if due and due.isoformat() in by_date:
-                    when_tail = it['when'].split(' ', 2)[-1] if it.get('when') else ''
+                    when_tail = it['when'].split(' ', 2)[-1] if (it.get('when') and it.get('due_at')) else ''
                     by_date[due.isoformat()]["fixed"].append(f"{when_tail} {course} {it.get('title') or ''} 截止".strip())
                 heavy = cc_state.weight_pct(it.get("weight")) >= 10
                 lead_days = lead["heavy"] if heavy else lead["light"]
