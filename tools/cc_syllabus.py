@@ -22,7 +22,9 @@ MAX_BYTES = 5 * 1024 * 1024
 MAX_PAGES = 60
 CHUNK_CHARS = 12000
 MAX_CHUNKS = 8
-MAX_REDIRECTS = 3
+MAX_REDIRECTS = 6
+_LOGIN_HINTS = ("login", "signin", "sign_in", "/sso", "saml", "oauth", "/cas/")
+LOGIN_REQUIRED = "链接需要登录才能看到，请在浏览器打开后下载 PDF 或网页文件再上传"
 FETCH_SECONDS = 30
 KINDS = ("exam", "quiz", "assignment", "project", "other")
 NO_TEXT = "无法识别文字，请提供文字版"
@@ -122,6 +124,7 @@ def fetch(url, permit=None, opener=None):
     opener = opener or urllib.request.build_opener(_NoRedirect())
     deadline = time.perf_counter() + FETCH_SECONDS
     current = check_url(url)
+    seen = {current}
     for _ in range(MAX_REDIRECTS + 1):
         request = urllib.request.Request(current, headers={"Accept": "application/pdf, text/plain, text/html",
                                                            "User-Agent": "jiujiastudy-syllabus/1"})
@@ -143,11 +146,69 @@ def fetch(url, permit=None, opener=None):
             exc.close()
             if exc.code in (301, 302, 303, 307, 308) and location:
                 current = check_url(urllib.parse.urljoin(current, location))
+                if current in seen or any(hint in current.lower() for hint in _LOGIN_HINTS):
+                    raise ValueError(LOGIN_REQUIRED) from None
+                seen.add(current)
                 continue
+            if exc.code in (401, 403):
+                raise ValueError(LOGIN_REQUIRED) from None
             raise ValueError(f"链接返回 HTTP {exc.code}") from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise ValueError("链接无法访问") from None
-    raise ValueError("链接重定向次数过多")
+    raise ValueError("链接跳转次数过多（通常是需要登录），请下载文件后上传")
+
+
+_CANVAS_SYLLABUS = re.compile(r"/courses/(\d+)(?:/assignments/syllabus|/syllabus)?/?")
+_CANVAS_FILE = re.compile(r"/courses/(\d+)/files/(\d+)(?:/(?:download|preview))?/?")
+_CANVAS_PAGE = re.compile(r"/courses/(\d+)/pages/([A-Za-z0-9_.%\-]{1,200})/?")
+
+
+def canvas_target(url, origin):
+    """Classify a link on the bound Canvas origin; returns (kind, course_id, ref) or None for other sites."""
+    parts = urllib.parse.urlsplit(url.strip())
+    host = (parts.hostname or "").lower()
+    if parts.scheme.lower() != "https" or f"https://{host}" != origin or parts.port not in (None, 443):
+        return None
+    path = parts.path
+    for kind, pattern in (("file", _CANVAS_FILE), ("page", _CANVAS_PAGE), ("syllabus", _CANVAS_SYLLABUS)):
+        match = pattern.fullmatch(path)
+        if match:
+            return kind, match.group(1), (match.group(2) if match.lastindex and match.lastindex > 1 else None)
+    raise ValueError("只支持 Canvas 课程大纲页、课程文件或课程页面链接")
+
+
+def canvas_fetch(api, target, permit=None):
+    """Read a Canvas syllabus/page/file through the API token. Returns (bytes, content type, name)."""
+    kind, course_id, ref = target
+    try:
+        if kind == "syllabus":
+            course = api.get(f"/api/v1/courses/{course_id}?include[]=syllabus_body")
+            body = (course or {}).get("syllabus_body") if isinstance(course, dict) else None
+            if not body:
+                raise ValueError("这门课的 Canvas 大纲页是空的，请贴大纲文件的链接或上传文件")
+            return body.encode("utf-8"), "text/html", "Canvas 大纲页"
+        if kind == "page":
+            slug = urllib.parse.quote(urllib.parse.unquote(ref), safe="")
+            page = api.get(f"/api/v1/courses/{course_id}/pages/{slug}")
+            body = page.get("body") if isinstance(page, dict) else None
+            if not body:
+                raise ValueError("这个 Canvas 页面没有内容")
+            return body.encode("utf-8"), "text/html", str(page.get("title") or "Canvas 页面")
+        meta = api.get(f"/api/v1/courses/{course_id}/files/{ref}")
+    except ValueError as exc:
+        if "HTTP 401" in str(exc) or "HTTP 403" in str(exc):
+            raise ValueError("Canvas 不允许读取这个内容（可能未发布或已锁定）") from None
+        if "HTTP 404" in str(exc):
+            raise ValueError("Canvas 上找不到这个内容") from None
+        raise
+    if not isinstance(meta, dict) or meta.get("locked_for_user") or not meta.get("url"):
+        raise ValueError("这个 Canvas 文件目前锁定或不可下载")
+    if (meta.get("size") or 0) > MAX_BYTES:
+        raise ValueError("文件超过 5MB")
+    name = str(meta.get("display_name") or meta.get("filename") or "syllabus")
+    # The file URL carries its own short-lived verifier; it is fetched without the Canvas token.
+    data, kind, _ = fetch(meta["url"], permit)
+    return data, kind, name
 
 
 def chunks(text):
@@ -224,7 +285,12 @@ def extract_nodes(endpoint, key, model, text, course, term_year, permit=None, be
             before_chunk()
         prompt = (f"课程：{course}\n学期年份：{term_year}\n片段：{index}\n"
                   f"<syllabus>\n{part}\n</syllabus>\n只输出指定 JSON。")
-        parsed, _, _ = cc_ai._chat_json(url, token, model_name, _SYSTEM, prompt, permit)
+        try:
+            parsed, _, _ = cc_ai._chat_json(url, token, model_name, _SYSTEM, prompt, permit)
+        except ValueError as exc:
+            if str(exc).endswith(("HTTP 401", "HTTP 403")):
+                raise ValueError("AI 服务拒绝了当前密钥（密钥无效或已过期），请管理员更新 AI 密钥") from None
+            raise
         for item in validate_items(parsed, part):
             marker = (item["title"].lower(), item["date"], item["kind"])
             if marker not in seen:

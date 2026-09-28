@@ -400,8 +400,16 @@ class AccountService:
             generation = saved.get("service_generation", 0)
             revision = saved.get("ai_revision", 0)
         if url is not None:
-            data, content_type, url = cc_syllabus.fetch(url, permit=lambda: self._require(generation))
-            name = urlsplit(url).path.rsplit("/", 1)[-1] or urlsplit(url).hostname
+            target = cc_syllabus.canvas_target(url, self.secrets.canvas_origin)
+            if target:
+                if target[1] != course_id:
+                    raise ValueError("链接属于另一门课，请在下拉框里选对应的课程")
+                api = SecureCanvas(self.secrets.canvas_origin, self.secrets.canvas_token,
+                                   permit=lambda: self._require(generation))
+                data, content_type, name = cc_syllabus.canvas_fetch(api, target, permit=lambda: self._require(generation))
+            else:
+                data, content_type, url = cc_syllabus.fetch(url, permit=lambda: self._require(generation))
+                name = urlsplit(url).path.rsplit("/", 1)[-1] or urlsplit(url).hostname
         if not isinstance(data, (bytes, bytearray)) or not data:
             raise ValueError("请选择大纲文件")
         text = cc_syllabus.extract_text(bytes(data), content_type, name)

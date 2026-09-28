@@ -120,6 +120,81 @@ class SyllabusGuards(unittest.TestCase):
         self.assertGreater(len(calls), 1)
         self.assertEqual(1, len(items))
 
+    def test_login_redirects_explain_download_instead_of_redirect_count(self):
+        import email.message
+        import urllib.error
+
+        def redirect_to(location, code=302):
+            headers = email.message.Message()
+            headers["Location"] = location
+            return urllib.error.HTTPError("https://uni.example/s", code, "Found", headers, None)
+
+        class Opener:
+            def __init__(self, errors):
+                self.errors = list(errors)
+
+            def open(self, request, timeout=None):
+                raise self.errors.pop(0)
+
+        public = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        cases = [
+            [redirect_to("https://idp.uni.example/login?next=/s")],
+            [redirect_to("/a"), redirect_to("/s")],
+            [urllib.error.HTTPError("https://uni.example/s", 403, "Forbidden", email.message.Message(), None)],
+        ]
+        with patch("cc_syllabus.socket.getaddrinfo", return_value=public):
+            for errors in cases:
+                with self.assertRaisesRegex(ValueError, "需要登录"):
+                    cc_syllabus.fetch("https://uni.example/s", opener=Opener(errors))
+
+    def test_rejected_ai_key_is_reported_as_key_problem(self):
+        with patch("cc_syllabus.cc_ai._chat_json",
+                   side_effect=ValueError("AI service request failed with HTTP 401")):
+            with self.assertRaisesRegex(ValueError, "AI 服务拒绝了当前密钥"):
+                cc_syllabus.extract_nodes("https://api.example", "k", "m", self.TEXT, "MATH", 2026)
+
+
+    def test_canvas_links_are_classified_only_on_bound_origin(self):
+        origin = "https://canvas.uni.example"
+        self.assertEqual(("syllabus", "123", None),
+                         cc_syllabus.canvas_target(origin + "/courses/123/assignments/syllabus", origin))
+        self.assertEqual(("file", "123", "456"),
+                         cc_syllabus.canvas_target(origin + "/courses/123/files/456/download?wrap=1", origin))
+        self.assertEqual(("page", "123", "course-outline"),
+                         cc_syllabus.canvas_target(origin + "/courses/123/pages/course-outline", origin))
+        self.assertIsNone(cc_syllabus.canvas_target("https://other.example/courses/123/files/456", origin))
+        with self.assertRaisesRegex(ValueError, "只支持 Canvas"):
+            cc_syllabus.canvas_target(origin + "/courses/123/discussion_topics/9", origin)
+
+    def test_canvas_reads_use_api_and_file_download_skips_token(self):
+        class Api:
+            def __init__(self, replies):
+                self.replies, self.paths = replies, []
+
+            def get(self, path):
+                self.paths.append(path)
+                reply = self.replies[path]
+                if isinstance(reply, Exception):
+                    raise reply
+                return reply
+
+        api = Api({"/api/v1/courses/1?include[]=syllabus_body": {"syllabus_body": "<p>Midterm Oct 15</p>"}})
+        data, kind, _ = cc_syllabus.canvas_fetch(api, ("syllabus", "1", None))
+        self.assertEqual((b"<p>Midterm Oct 15</p>", "text/html"), (data, kind))
+
+        api = Api({"/api/v1/courses/1/files/2": {"url": "https://files.example/x?verifier=v", "size": 10,
+                                                 "display_name": "syllabus.pdf"}})
+        with patch("cc_syllabus.fetch", return_value=(b"%PDF", "application/pdf", "u")) as plain:
+            self.assertEqual((b"%PDF", "application/pdf", "syllabus.pdf"),
+                             cc_syllabus.canvas_fetch(api, ("file", "1", "2")))
+        plain.assert_called_once()
+
+        api = Api({"/api/v1/courses/1/files/3": {"locked_for_user": True}})
+        with self.assertRaisesRegex(ValueError, "锁定"):
+            cc_syllabus.canvas_fetch(api, ("file", "1", "3"))
+        api = Api({"/api/v1/courses/1/pages/x": ValueError("Canvas API request failed with HTTP 404")})
+        with self.assertRaisesRegex(ValueError, "找不到"):
+            cc_syllabus.canvas_fetch(api, ("page", "1", "x"))
 
 if __name__ == "__main__":
     unittest.main()
