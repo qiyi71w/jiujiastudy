@@ -1389,9 +1389,24 @@
     dialog.showModal();
   }
 
+  let syllabusStatus = null;
+  let syllabusTimer = null;
+
+  function syllabusError(e) {
+    if (e.status === 413) return '文件太大，请上传 5MB 以内的大纲。';
+    if (e.status === 502 || e.status === 504) return '识别超时或服务暂时不可用，请稍后重试；已消耗的 AI 额度不会退回。';
+    return e.message || '未知错误';
+  }
+
   function renderSyllabusPanel(syllabus) {
     const box = el('details', 'cal-syllabus');
     box.appendChild(el('summary', null, '导入课程大纲（考试日期）'));
+    if (syllabusStatus) {
+      box.open = true;
+      const status = el('p', 'cal-syllabus-status is-' + syllabusStatus.kind, syllabusStatus.text);
+      status.setAttribute('role', syllabusStatus.kind === 'error' ? 'alert' : 'status');
+      box.appendChild(status);
+    }
     box.appendChild(el('p', 'cal-event-meta', 'AI 会从大纲里找出考试、作业等日期，每项都要你确认后才进日历；每个片段消耗 1 次 AI 额度。扫描版 PDF 暂不支持。'));
     const courses = (currentState.courses || []).filter(c => c.monitored && !c.inactive);
     const form = el('form', 'cal-syllabus-form');
@@ -1450,23 +1465,46 @@
     return box;
   }
 
+  function setSyllabusStatus(kind, text) {
+    syllabusStatus = kind ? { kind, text } : null;
+    const node = document.querySelector('.cal-syllabus-status');
+    if (node && syllabusStatus) {
+      node.className = 'cal-syllabus-status is-' + kind;
+      node.textContent = text;
+    } else {
+      renderAll();
+    }
+  }
+
   async function uploadSyllabus(body) {
     if (isSubmitting) return;
     const session = csrfToken;
-    setSaving(true);
+    const started = Date.now();
     hideBanner();
-    showToast('正在识别大纲，可能需要一分钟…');
+    setSyllabusStatus('pending', '正在识别大纲…');
+    setSaving(true);
+    clearInterval(syllabusTimer);
+    syllabusTimer = setInterval(() => {
+      const secs = Math.round((Date.now() - started) / 1000);
+      setSyllabusStatus('pending', '正在识别大纲…已用 ' + secs + ' 秒（长大纲可能需要几分钟，请不要关闭页面）');
+    }, 1000);
     try {
       const res = await apiRequest('/api/syllabus', { method: 'POST', body });
       if (csrfToken !== session) return;
       if (res && res.state) currentState = res.state;
-      if (res && res.result && res.result.text) showToast(res.result.text);
-      renderAll();
+      const text = (res && res.result && res.result.text) || '识别完成。';
+      syllabusStatus = { kind: 'done', text: '✓ ' + text };
+      showToast(text);
     } catch (e) {
       if (csrfToken !== session) return;
-      if (e.status !== 409 && e.status !== 401) showBanner('导入失败：' + (e.message || '未知错误'), 'error');
+      syllabusStatus = e.status === 401 ? null : { kind: 'error', text: '✗ 识别失败：' + syllabusError(e) };
     } finally {
-      if (csrfToken === session) setSaving(false);
+      clearInterval(syllabusTimer);
+      syllabusTimer = null;
+      if (csrfToken === session) {
+        setSaving(false);
+        renderAll();
+      }
     }
   }
 

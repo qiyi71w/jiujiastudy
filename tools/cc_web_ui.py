@@ -217,6 +217,10 @@ LOCAL_CSS = """
 .cal-undated,.cal-syllabus{border-top:1px solid var(--line);padding:var(--s2) 0;margin-top:var(--s2)}
 .cal-undated summary,.cal-syllabus summary{cursor:pointer;font-weight:600;min-height:44px;display:flex;align-items:center}
 .cal-syllabus-form{display:flex;flex-wrap:wrap;gap:var(--s2);align-items:center;margin:var(--s2) 0}
+.cal-syllabus-status{margin:var(--s2) 0;padding:var(--s2) var(--s3);border-radius:var(--r-s);font-size:var(--fs-s);border:1px solid var(--line)}
+.cal-syllabus-status.is-pending{color:var(--muted)}
+.cal-syllabus-status.is-done{color:var(--good);border-color:var(--good)}
+.cal-syllabus-status.is-error{color:var(--bad);border-color:var(--bad)}
 .cal-select,.cal-link-input,.cal-date-input{padding:var(--s1) var(--s2);border:1px solid var(--line);border-radius:var(--r-s);background:var(--bg);color:var(--ink);font:inherit}
 .cal-link-input{flex:1 1 220px}
 .cal-source{display:flex;justify-content:space-between;align-items:center;gap:var(--s2);padding:var(--s1) 0;font-size:var(--fs-s)}
