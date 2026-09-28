@@ -1294,7 +1294,7 @@
     card.appendChild(summary);
 
     if (undated.length) {
-      const box = el('details', 'cal-undated');
+      const box = calendarFold('cal-undated', 'undated');
       box.appendChild(el('summary', null, '日期未定（' + undated.length + '）'));
       undated.forEach(ev => box.appendChild(renderCalendarEvent(ev)));
       card.appendChild(box);
@@ -1393,6 +1393,17 @@
 
   let syllabusStatus = null;
   let syllabusTimer = null;
+  let syllabusCourse = null;
+  let syllabusLink = '';
+  // Re-rendering after any action rebuilds these panels; remember whether the user left them open.
+  const calendarOpen = { undated: false, syllabus: false };
+
+  function calendarFold(cls, key) {
+    const box = el('details', cls);
+    box.open = calendarOpen[key];
+    box.addEventListener('toggle', () => { calendarOpen[key] = box.open; });
+    return box;
+  }
 
   function syllabusError(e) {
     if (e.status === 413) return '文件太大，请上传 5MB 以内的大纲。';
@@ -1401,10 +1412,10 @@
   }
 
   function renderSyllabusPanel(syllabus) {
-    const box = el('details', 'cal-syllabus');
+    const box = calendarFold('cal-syllabus', 'syllabus');
     box.appendChild(el('summary', null, '导入课程大纲（考试日期）'));
     if (syllabusStatus) {
-      box.open = true;
+      box.open = calendarOpen.syllabus = true;
       const status = el('p', 'cal-syllabus-status is-' + syllabusStatus.kind, syllabusStatus.text);
       status.setAttribute('role', syllabusStatus.kind === 'error' ? 'alert' : 'status');
       box.appendChild(status);
@@ -1419,6 +1430,8 @@
       o.value = c.id;
       select.appendChild(o);
     });
+    if (courses.some(c => String(c.id) === String(syllabusCourse))) select.value = syllabusCourse;
+    select.addEventListener('change', () => { syllabusCourse = select.value; });
     const file = el('input');
     file.type = 'file';
     file.accept = '.pdf,.txt,application/pdf,text/plain';
@@ -1427,6 +1440,8 @@
     link.type = 'url';
     link.placeholder = '或粘贴 https 大纲链接';
     link.setAttribute('aria-label', '大纲链接');
+    link.value = syllabusLink;
+    link.addEventListener('input', () => { syllabusLink = link.value; });
     const submit = el('button', 'btn btn-primary btn-sm', '开始识别');
     submit.type = 'submit';
     const aiOff = !currentState.settings || !currentState.settings.ai_enabled;
@@ -1496,6 +1511,7 @@
       if (res && res.state) currentState = res.state;
       const text = (res && res.result && res.result.text) || '识别完成。';
       syllabusStatus = { kind: 'done', text: '✓ ' + text };
+      syllabusLink = '';
       showToast(text);
     } catch (e) {
       if (csrfToken !== session) return;
