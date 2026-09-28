@@ -158,6 +158,7 @@ class SyllabusGuards(unittest.TestCase):
         origin = "https://canvas.uni.example"
         self.assertEqual(("syllabus", "123", None),
                          cc_syllabus.canvas_target(origin + "/courses/123/assignments/syllabus", origin))
+        self.assertEqual(("home", "123", None), cc_syllabus.canvas_target(origin + "/courses/123", origin))
         self.assertEqual(("file", "123", "456"),
                          cc_syllabus.canvas_target(origin + "/courses/123/files/456/download?wrap=1", origin))
         self.assertEqual(("page", "123", "course-outline"),
@@ -178,9 +179,29 @@ class SyllabusGuards(unittest.TestCase):
                     raise reply
                 return reply
 
-        api = Api({"/api/v1/courses/1?include[]=syllabus_body": {"syllabus_body": "<p>Midterm Oct 15</p>"}})
+        long_body = "<p>Midterm exam: October 15, 2026.</p>" + "<p>Course policy and grading details.</p>" * 10
+        course = "/api/v1/courses/1?include[]=syllabus_body"
+        front = "/api/v1/courses/1/front_page"
+        api = Api({course: {"syllabus_body": long_body, "default_view": "modules"}})
         data, kind, _ = cc_syllabus.canvas_fetch(api, ("syllabus", "1", None))
-        self.assertEqual((b"<p>Midterm Oct 15</p>", "text/html"), (data, kind))
+        self.assertEqual((long_body.encode(), "text/html"), (data, kind))
+
+        # Home page is the syllabus: empty syllabus section falls back to the course front page.
+        api = Api({course: {"syllabus_body": "", "default_view": "wiki"},
+                   front: {"title": "Course 101 Syllabus", "body": long_body}})
+        for target in (("syllabus", "1", None), ("home", "1", None)):
+            data, _, name = cc_syllabus.canvas_fetch(api, target)
+            self.assertEqual((long_body.encode(), "Course 101 Syllabus"), (data, name))
+
+        # A near-empty syllabus section that links to an outline page reads that page.
+        api = Api({course: {"syllabus_body": '<a href="/courses/1/pages/outline">Outline</a>'},
+                   "/api/v1/courses/1/pages/outline": {"title": "Outline", "body": long_body}})
+        self.assertEqual("Outline", cc_syllabus.canvas_fetch(api, ("syllabus", "1", None))[2])
+
+        api = Api({course: {"syllabus_body": ""},
+                   front: ValueError("Canvas API request failed with HTTP 404")})
+        with self.assertRaisesRegex(ValueError, "主页都没有可识别的文字"):
+            cc_syllabus.canvas_fetch(api, ("syllabus", "1", None))
 
         api = Api({"/api/v1/courses/1/files/2": {"url": "https://files.example/x?verifier=v", "size": 10,
                                                  "display_name": "syllabus.pdf"}})

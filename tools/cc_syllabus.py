@@ -158,9 +158,11 @@ def fetch(url, permit=None, opener=None):
     raise ValueError("链接跳转次数过多（通常是需要登录），请下载文件后上传")
 
 
-_CANVAS_SYLLABUS = re.compile(r"/courses/(\d+)(?:/assignments/syllabus|/syllabus)?/?")
+_CANVAS_HOME = re.compile(r"/courses/(\d+)(?:/wiki)?/?")
+_CANVAS_SYLLABUS = re.compile(r"/courses/(\d+)/(?:assignments/)?syllabus/?")
 _CANVAS_FILE = re.compile(r"/courses/(\d+)/files/(\d+)(?:/(?:download|preview))?/?")
 _CANVAS_PAGE = re.compile(r"/courses/(\d+)/pages/([A-Za-z0-9_.%\-]{1,200})/?")
+_MIN_TEXT = 200
 
 
 def canvas_target(url, origin):
@@ -170,30 +172,66 @@ def canvas_target(url, origin):
     if parts.scheme.lower() != "https" or f"https://{host}" != origin or parts.port not in (None, 443):
         return None
     path = parts.path
-    for kind, pattern in (("file", _CANVAS_FILE), ("page", _CANVAS_PAGE), ("syllabus", _CANVAS_SYLLABUS)):
+    for kind, pattern in (("file", _CANVAS_FILE), ("page", _CANVAS_PAGE), ("syllabus", _CANVAS_SYLLABUS),
+                          ("home", _CANVAS_HOME)):
         match = pattern.fullmatch(path)
         if match:
             return kind, match.group(1), (match.group(2) if match.lastindex and match.lastindex > 1 else None)
     raise ValueError("只支持 Canvas 课程大纲页、课程文件或课程页面链接")
 
 
+def _meaningful(body):
+    return len(" ".join(_html_text(body or "").split())) >= _MIN_TEXT
+
+
+def _page(api, course_id, slug):
+    slug = urllib.parse.quote(urllib.parse.unquote(slug), safe="")
+    page = api.get(f"/api/v1/courses/{course_id}/pages/{slug}")
+    return page if isinstance(page, dict) else {}
+
+
+def _front_page(api, course_id):
+    try:
+        page = api.get(f"/api/v1/courses/{course_id}/front_page")
+    except ValueError as exc:
+        if "HTTP 404" in str(exc):
+            return {}
+        raise
+    return page if isinstance(page, dict) else {}
+
+
+def _course_text(api, course_id, prefer_home):
+    """Syllabus section, a page it links to, or the course home page — first one with real text."""
+    course = api.get(f"/api/v1/courses/{course_id}?include[]=syllabus_body")
+    course = course if isinstance(course, dict) else {}
+    syllabus = course.get("syllabus_body") or ""
+    candidates = []
+    home = lambda: _front_page(api, course_id)
+    if prefer_home and course.get("default_view") == "wiki":
+        candidates.append(home)
+    candidates.append(lambda: {"body": syllabus, "title": "Canvas 大纲页"})
+    for slug in re.findall(rf"/courses/{course_id}/pages/([A-Za-z0-9_.%\-]{{1,200}})", syllabus)[:2]:
+        candidates.append(lambda slug=slug: _page(api, course_id, slug))
+    if home not in candidates:
+        candidates.append(home)
+    for load in candidates:
+        page = load()
+        if _meaningful(page.get("body")):
+            return page["body"].encode("utf-8"), "text/html", str(page.get("title") or "Canvas 大纲")
+    raise ValueError("这门课的 Canvas 大纲页和主页都没有可识别的文字，请贴大纲文件（PDF）的链接或上传文件")
+
+
 def canvas_fetch(api, target, permit=None):
-    """Read a Canvas syllabus/page/file through the API token. Returns (bytes, content type, name)."""
+    """Read a Canvas syllabus/home/page/file through the API token. Returns (bytes, content type, name)."""
     kind, course_id, ref = target
     try:
-        if kind == "syllabus":
-            course = api.get(f"/api/v1/courses/{course_id}?include[]=syllabus_body")
-            body = (course or {}).get("syllabus_body") if isinstance(course, dict) else None
-            if not body:
-                raise ValueError("这门课的 Canvas 大纲页是空的，请贴大纲文件的链接或上传文件")
-            return body.encode("utf-8"), "text/html", "Canvas 大纲页"
+        if kind in ("syllabus", "home"):
+            return _course_text(api, course_id, prefer_home=kind == "home")
         if kind == "page":
-            slug = urllib.parse.quote(urllib.parse.unquote(ref), safe="")
-            page = api.get(f"/api/v1/courses/{course_id}/pages/{slug}")
-            body = page.get("body") if isinstance(page, dict) else None
-            if not body:
+            page = _page(api, course_id, ref)
+            if not page.get("body"):
                 raise ValueError("这个 Canvas 页面没有内容")
-            return body.encode("utf-8"), "text/html", str(page.get("title") or "Canvas 页面")
+            return page["body"].encode("utf-8"), "text/html", str(page.get("title") or "Canvas 页面")
         meta = api.get(f"/api/v1/courses/{course_id}/files/{ref}")
     except ValueError as exc:
         if "HTTP 401" in str(exc) or "HTTP 403" in str(exc):
